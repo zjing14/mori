@@ -180,8 +180,6 @@ AMD SDMA engines and NVIDIA Copy Engines (CEs) serve the same fundamental purpos
 | **Openness** | Fully open: packet formats in public headers (`sdma_pkt_struct.h`), KFD interface in open-source kernel driver, GPU-side ring buffer protocol documented | Closed: CE internals are proprietary; users interact through CUDA runtime/driver abstractions |
 | **GPU-initiated control** | First-class: designed for GPU kernels to directly construct and submit packets — the core of Mori's SDMA transport | Emerging: NVIDIA added device-initiated CE support in recent NCCL versions for collective operations, but it remains limited in scope and not a general-purpose API |
 | **Granularity of control** | Fine-grained: choose specific engine, manage queue depth, combine copy + atomic + fence in a single submission batch | Coarse-grained: CUDA driver decides which CE to use; user controls concurrency only at the stream level |
-| **Async copy instructions** | SDMA is a separate engine; there's also `async_copy` for shared memory (LDS) via the memory pipeline within CUs | NVIDIA has `cp.async` / `cp.async.bulk` (TMA on Hopper) for global→shared memory copies within SMs, separate from CEs |
-| **TMA equivalent** | No direct equivalent to NVIDIA's Tensor Memory Accelerator (TMA); SDMA operates at the system memory level, not the SM/CU level | Hopper TMA is a per-SM unit for tiled/tensor memory access patterns — architecturally different from CEs |
 
 #### Summary of Key Differences
 
