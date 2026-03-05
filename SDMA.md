@@ -191,8 +191,6 @@ AMD SDMA engines and NVIDIA Copy Engines (CEs) serve the same fundamental purpos
 
 4. **Queue management**: AMD requires explicit queue setup and management (create queue per engine, manage ring buffer pointers, handle wraparound). NVIDIA handles this transparently in the driver.
 
-5. **Splitting copies**: Mori explicitly splits large copies across multiple SDMA engines for bandwidth aggregation. On NVIDIA, a single `cudaMemcpyAsync` goes to one CE; achieving multi-CE parallelism requires issuing multiple overlapping copies on separate streams.
-
 6. **Completion model**: AMD SDMA uses explicit atomic signals in GPU memory with software spin-waits. NVIDIA uses CUDA events backed by internal CE semaphores — a higher-level abstraction.
 
 7. **Scope overlap with in-SM async copy**: Both vendors also have in-CU/SM async copy mechanisms (`async_copy` on AMD, `cp.async`/TMA on NVIDIA) that are architecturally separate from the DMA engines. These operate at the shared memory (LDS/SMEM) level and serve different use cases (prefetching tiles for matrix operations) than the system-level DMA engines.
