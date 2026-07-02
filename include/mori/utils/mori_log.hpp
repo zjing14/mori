@@ -21,35 +21,24 @@
 // SOFTWARE.
 #pragma once
 
-#ifndef SPDLOG_HEADER_ONLY
-#define SPDLOG_HEADER_ONLY
-#endif
-
+#include <algorithm>
+#include <cctype>
 #include <chrono>
-#include <string>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <algorithm>
-#include <cstdlib>
-#include <cctype>
 
-#include "spdlog/spdlog.h"
-#include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/basic_file_sink.h"
+#include "spdlog/sinks/stdout_color_sinks.h"
+#include "spdlog/spdlog.h"
 
 namespace mori {
 
 class ModuleLogger {
  public:
-  enum class Level {
-    TRACE = 0,
-    DEBUG = 1,
-    INFO = 2,
-    WARN = 3,
-    ERROR = 4,
-    CRITICAL = 5
-  };
+  enum class Level { TRACE = 0, DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4, CRITICAL = 5 };
 
   static ModuleLogger& GetInstance() {
     static ModuleLogger instance;
@@ -67,25 +56,33 @@ class ModuleLogger {
   }
 
  public:
-
   // Initialize a module-specific logger
   void InitModule(const std::string& moduleName, Level level = Level::ERROR) {
     // Check if logger already exists
     auto existing_logger = spdlog::get(moduleName);
     std::shared_ptr<spdlog::logger> logger;
-    
+
     if (existing_logger) {
       // Use existing logger
       logger = existing_logger;
     } else {
-      // Create new logger
-      logger = spdlog::stdout_color_mt(moduleName);
-      logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%P] [%n] [%^%l%$] %v");
+      // spdlog::stdout_color_mt throws if another thread already registered the same name
+      // between our spdlog::get() check and this call — catch and fall back to the winner.
+      try {
+        logger = spdlog::stdout_color_mt(moduleName);
+        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%P] [%n] [%^%l%$] %v");
+      } catch (const spdlog::spdlog_ex&) {
+        logger = spdlog::get(moduleName);
+      }
+      // Defensive: spdlog::get may still return null if registration was
+      // dropped between throw and our second lookup. Bail out cleanly
+      // instead of dereferencing a null shared_ptr below.
+      if (!logger) return;
     }
-    
+
     // Determine the log level priority: env var > global setting > provided level
     Level finalLevel = level;
-    
+
     // Check environment variable first
     std::string envVar;
     if (moduleName == "application") {
@@ -96,7 +93,7 @@ class ModuleLogger {
       std::transform(envVar.begin(), envVar.end(), envVar.begin(), ::toupper);
     }
     const char* envLevel = std::getenv(envVar.c_str());
-    
+
     if (envLevel) {
       finalLevel = LevelFromString(std::string(envLevel));
       envOverrides_[moduleName] = finalLevel;
@@ -104,7 +101,7 @@ class ModuleLogger {
       // Use global setting if no env var and global level is set
       finalLevel = globalLevel_;
     }
-    
+
     logger->set_level(ConvertLevel(finalLevel));
     loggers_[moduleName] = logger;
   }
@@ -126,10 +123,13 @@ class ModuleLogger {
     if (HasEnvOverride(moduleName)) {
       // Log a warning but don't change the level
       auto logger = GetLogger("application");  // Use application logger for warnings
-      logger->warn("Attempted to change log level for module '{}' which is controlled by environment variable. Use ForceSetModuleLevel() to override.", moduleName);
+      logger->warn(
+          "Attempted to change log level for module '{}' which is controlled by environment "
+          "variable. Use ForceSetModuleLevel() to override.",
+          moduleName);
       return;
     }
-    
+
     auto logger = GetLogger(moduleName);
     logger->set_level(ConvertLevel(level));
   }
@@ -138,7 +138,7 @@ class ModuleLogger {
   void SetGlobalLevel(Level level) {
     globalLevel_ = level;
     globalLevelSet_ = true;
-    
+
     // Apply to all existing loggers
     for (auto& [name, logger] : loggers_) {
       // Skip modules controlled by environment variables
@@ -163,9 +163,7 @@ class ModuleLogger {
   }
 
   // Clear environment overrides for a module
-  void ClearEnvOverride(const std::string& moduleName) {
-    envOverrides_.erase(moduleName);
-  }
+  void ClearEnvOverride(const std::string& moduleName) { envOverrides_.erase(moduleName); }
 
   // Force set log level (ignores env protection)
   void ForceSetModuleLevel(const std::string& moduleName, Level level) {
@@ -174,25 +172,19 @@ class ModuleLogger {
   }
 
   // Get current global level
-  Level GetGlobalLevel() const {
-    return globalLevel_;
-  }
+  Level GetGlobalLevel() const { return globalLevel_; }
 
   // Check if global level is set
-  bool IsGlobalLevelSet() const {
-    return globalLevelSet_;
-  }
+  bool IsGlobalLevelSet() const { return globalLevelSet_; }
 
   // Clear global level setting (revert to individual module control)
-  void ClearGlobalLevel() {
-    globalLevelSet_ = false;
-  }
+  void ClearGlobalLevel() { globalLevelSet_ = false; }
 
   // Convert string to level
   Level LevelFromString(const std::string& strLevel) {
     std::string lower_level = strLevel;
     std::transform(lower_level.begin(), lower_level.end(), lower_level.begin(), ::tolower);
-    
+
     if (lower_level == "trace") return Level::TRACE;
     if (lower_level == "debug") return Level::DEBUG;
     if (lower_level == "info") return Level::INFO;
@@ -215,12 +207,18 @@ class ModuleLogger {
 
   spdlog::level::level_enum ConvertLevel(Level level) {
     switch (level) {
-      case Level::TRACE: return spdlog::level::trace;
-      case Level::DEBUG: return spdlog::level::debug;
-      case Level::INFO: return spdlog::level::info;
-      case Level::WARN: return spdlog::level::warn;
-      case Level::ERROR: return spdlog::level::err;
-      case Level::CRITICAL: return spdlog::level::critical;
+      case Level::TRACE:
+        return spdlog::level::trace;
+      case Level::DEBUG:
+        return spdlog::level::debug;
+      case Level::INFO:
+        return spdlog::level::info;
+      case Level::WARN:
+        return spdlog::level::warn;
+      case Level::ERROR:
+        return spdlog::level::err;
+      case Level::CRITICAL:
+        return spdlog::level::critical;
     }
     return spdlog::level::err;
   }
@@ -233,7 +231,9 @@ constexpr const char* IO = "io";
 constexpr const char* SHMEM = "shmem";
 constexpr const char* CORE = "core";
 constexpr const char* OPS = "ops";
-} // namespace modules
+constexpr const char* UMBP = "umbp";
+constexpr const char* METRICS = "metrics";
+}  // namespace modules
 
 // Macro helpers
 #define MORI_GET_LOGGER(module) mori::ModuleLogger::GetInstance().GetLogger(module)
@@ -284,18 +284,37 @@ constexpr const char* OPS = "ops";
 #define MORI_OPS_ERROR(...) MORI_ERROR(mori::modules::OPS, __VA_ARGS__)
 #define MORI_OPS_CRITICAL(...) MORI_CRITICAL(mori::modules::OPS, __VA_ARGS__)
 
+#define MORI_UMBP_TRACE(...) MORI_TRACE(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_DEBUG(...) MORI_DEBUG(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_INFO(...) MORI_INFO(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_WARN(...) MORI_WARN(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_ERROR(...) MORI_ERROR(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_CRITICAL(...) MORI_CRITICAL(mori::modules::UMBP, __VA_ARGS__)
+
+#define MORI_METRICS_TRACE(...) MORI_TRACE(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_DEBUG(...) MORI_DEBUG(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_INFO(...) MORI_INFO(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_WARN(...) MORI_WARN(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_ERROR(...) MORI_ERROR(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_CRITICAL(...) MORI_CRITICAL(mori::modules::METRICS, __VA_ARGS__)
+
 // Scoped Timer class
 class ScopedTimer {
  public:
   using Clock = std::chrono::steady_clock;
 
-  explicit ScopedTimer(const std::string& name, const std::string& module = mori::modules::APPLICATION) 
-    : name_(name), module_(module), start_(Clock::now()) {}
+  explicit ScopedTimer(const std::string& name,
+                       const std::string& module = mori::modules::APPLICATION)
+      : name_(name), module_(module), start_(Clock::now()) {}
 
   ~ScopedTimer() {
     auto end = Clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
     MORI_DEBUG(module_, "ScopedTimer [{}] took {} ns", name_, duration);
+  }
+
+  double ElapsedSeconds() const {
+    return std::chrono::duration<double>(Clock::now() - start_).count();
   }
 
   ScopedTimer(const ScopedTimer&) = delete;
@@ -313,13 +332,15 @@ class ScopedTimer {
 // Initialization helper functions
 inline void InitializeLogging() {
   auto& logger = ModuleLogger::GetInstance();
-  
+
   // Initialize all modules with default ERROR level
   logger.InitModule(modules::APPLICATION);
   logger.InitModule(modules::IO);
   logger.InitModule(modules::SHMEM);
   logger.InitModule(modules::CORE);
   logger.InitModule(modules::OPS);
+  logger.InitModule(modules::UMBP);
+  logger.InitModule(modules::METRICS);
 }
 
 inline void InitializeLogging(const std::string& globalLevel) {
@@ -332,15 +353,16 @@ inline void InitializeLogging(const std::string& globalLevel) {
 inline void InitializeLoggingFromEnv() {
   InitializeLogging();
   auto& logger = ModuleLogger::GetInstance();
-  
+
   // Check global log level first
   const char* globalLevel = std::getenv("MORI_GLOBAL_LOG_LEVEL");
   if (globalLevel) {
     auto level = logger.LevelFromString(globalLevel);
     logger.SetGlobalLevel(level);
-    MORI_INFO(modules::APPLICATION, "Set global MORI log level to {} from MORI_GLOBAL_LOG_LEVEL", globalLevel);
+    MORI_INFO(modules::APPLICATION, "Set global MORI log level to {} from MORI_GLOBAL_LOG_LEVEL",
+              globalLevel);
   }
-  
+
   // Check module-specific log levels (these override global)
   const char* appLevel = std::getenv("MORI_APP_LOG_LEVEL");
   if (appLevel) {
@@ -348,35 +370,42 @@ inline void InitializeLoggingFromEnv() {
     logger.SetModuleLevelInternal(modules::APPLICATION, level, true);
     MORI_APP_INFO("Set APPLICATION log level to {} from MORI_APP_LOG_LEVEL", appLevel);
   }
-  
+
   const char* ioLevel = std::getenv("MORI_IO_LOG_LEVEL");
   if (ioLevel) {
     auto level = logger.LevelFromString(ioLevel);
     logger.SetModuleLevelInternal(modules::IO, level, true);
     MORI_IO_INFO("Set IO log level to {} from MORI_IO_LOG_LEVEL", ioLevel);
   }
-  
+
   const char* shmemLevel = std::getenv("MORI_SHMEM_LOG_LEVEL");
   if (shmemLevel) {
     auto level = logger.LevelFromString(shmemLevel);
     logger.SetModuleLevelInternal(modules::SHMEM, level, true);
     MORI_SHMEM_INFO("Set SHMEM log level to {} from MORI_SHMEM_LOG_LEVEL", shmemLevel);
   }
-  
+
   const char* coreLevel = std::getenv("MORI_CORE_LOG_LEVEL");
   if (coreLevel) {
     auto level = logger.LevelFromString(coreLevel);
     logger.SetModuleLevelInternal(modules::CORE, level, true);
     MORI_CORE_INFO("Set CORE log level to {} from MORI_CORE_LOG_LEVEL", coreLevel);
   }
-  
+
   const char* opsLevel = std::getenv("MORI_OPS_LOG_LEVEL");
   if (opsLevel) {
     auto level = logger.LevelFromString(opsLevel);
     logger.SetModuleLevelInternal(modules::OPS, level, true);
     MORI_OPS_INFO("Set OPS log level to {} from MORI_OPS_LOG_LEVEL", opsLevel);
   }
-  
+
+  const char* umbpLevel = std::getenv("MORI_UMBP_LOG_LEVEL");
+  if (umbpLevel) {
+    auto level = logger.LevelFromString(umbpLevel);
+    logger.SetModuleLevelInternal(modules::UMBP, level, true);
+    MORI_UMBP_INFO("Set UMBP log level to {} from MORI_UMBP_LOG_LEVEL", umbpLevel);
+  }
+
   // Check for log pattern override
   const char* logPattern = std::getenv("MORI_LOG_PATTERN");
   if (logPattern) {
@@ -385,7 +414,7 @@ inline void InitializeLoggingFromEnv() {
     }
     MORI_INFO(modules::APPLICATION, "Set custom log pattern from MORI_LOG_PATTERN: {}", logPattern);
   }
-  
+
   // Check for log output file
   const char* logFile = std::getenv("MORI_LOG_FILE");
   if (logFile) {
@@ -400,10 +429,11 @@ inline void InitializeLoggingFromEnv() {
       MORI_ERROR(modules::APPLICATION, "Failed to open log file {}: {}", logFile, e.what());
     }
   }
-  
+
   // Check if logging should be disabled
   const char* disableLogging = std::getenv("MORI_DISABLE_LOGGING");
-  if (disableLogging && (std::string(disableLogging) == "1" || std::string(disableLogging) == "true")) {
+  if (disableLogging &&
+      (std::string(disableLogging) == "1" || std::string(disableLogging) == "true")) {
     logger.SetGlobalLevel(ModuleLogger::Level::CRITICAL);
     // Note: We can't log this since logging is disabled!
   }
@@ -434,15 +464,22 @@ inline std::string GetModuleLogLevel(const std::string& moduleName) {
   auto& logger = ModuleLogger::GetInstance();
   auto moduleLogger = logger.GetLogger(moduleName);
   auto level = moduleLogger->level();
-  
+
   switch (level) {
-    case spdlog::level::trace: return "trace";
-    case spdlog::level::debug: return "debug";
-    case spdlog::level::info: return "info";
-    case spdlog::level::warn: return "warn";
-    case spdlog::level::err: return "error";
-    case spdlog::level::critical: return "critical";
-    default: return "unknown";
+    case spdlog::level::trace:
+      return "trace";
+    case spdlog::level::debug:
+      return "debug";
+    case spdlog::level::info:
+      return "info";
+    case spdlog::level::warn:
+      return "warn";
+    case spdlog::level::err:
+      return "error";
+    case spdlog::level::critical:
+      return "critical";
+    default:
+      return "unknown";
   }
 }
 
@@ -456,15 +493,22 @@ inline void SetGlobalLogLevel(const std::string& level) {
 inline std::string GetGlobalLogLevel() {
   auto& logger = ModuleLogger::GetInstance();
   auto level = logger.GetGlobalLevel();
-  
+
   switch (level) {
-    case ModuleLogger::Level::TRACE: return "trace";
-    case ModuleLogger::Level::DEBUG: return "debug";
-    case ModuleLogger::Level::INFO: return "info";
-    case ModuleLogger::Level::WARN: return "warn";
-    case ModuleLogger::Level::ERROR: return "error";
-    case ModuleLogger::Level::CRITICAL: return "critical";
-    default: return "unknown";
+    case ModuleLogger::Level::TRACE:
+      return "trace";
+    case ModuleLogger::Level::DEBUG:
+      return "debug";
+    case ModuleLogger::Level::INFO:
+      return "info";
+    case ModuleLogger::Level::WARN:
+      return "warn";
+    case ModuleLogger::Level::ERROR:
+      return "error";
+    case ModuleLogger::Level::CRITICAL:
+      return "critical";
+    default:
+      return "unknown";
   }
 }
 
@@ -478,4 +522,4 @@ inline void ClearGlobalLogLevel() {
   logger.ClearGlobalLevel();
 }
 
-} // namespace mori
+}  // namespace mori

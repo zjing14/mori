@@ -24,8 +24,8 @@
 
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;
@@ -40,9 +40,9 @@ __global__ void Atomic(RdmaEndpoint& endpoint, RdmaMemoryRegion localMr, RdmaMem
                        atomicType amoOp, int iters) {
   T value = 1;
   for (int i = 0; i < iters; i++) {
-    uint64_t dbr_val = PostAtomic<PrvdType, T>(
-        endpoint.wqHandle, endpoint.handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr,
-        remoteMr.rkey, value, value, amoOp);
+    uint64_t dbr_val =
+        PostAtomic<PrvdType, T>(endpoint.wqHandle, endpoint.handle.qpn, localMr.addr, localMr.lkey,
+                                remoteMr.addr, remoteMr.rkey, value, value, amoOp);
     __threadfence_system();
     UpdateDbrAndRingDbSend<PrvdType>(endpoint.wqHandle.dbrRecAddr, endpoint.wqHandle.postIdx,
                                      endpoint.wqHandle.dbrAddr, dbr_val,

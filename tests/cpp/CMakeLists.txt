@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# GoogleTest — fetched once here; gtest_main is available to all subdirs.
+# ---------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.14.0
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(googletest)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -10,16 +21,73 @@ add_executable(test_transport_ibverbs application/test_transport_ibverbs.cpp)
 target_include_directories(test_transport_ibverbs
                            PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_transport_ibverbs mori_application)
+# This test calls libibverbs directly (e.g. ibv_get_cq_event); mori_application
+# no longer re-exports those symbols (they are dlopen'd internally). Link the
+# dlopen shim instead of the real libibverbs so BUILD_TESTS=ON does not
+# reintroduce a link-time dependency on a host without RDMA installed.
+target_link_libraries(test_transport_ibverbs mori_application mori_ibv_shim)
 
-add_executable(test_engine io/test_engine.cpp)
+if(BUILD_IO)
+  add_executable(test_protocol io/test_protocol.cpp)
 
-target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_engine mori_application mori_io)
+  target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_protocol mori_application mori_io)
 
-add_executable(test_topology application/test_topology.cpp)
+  add_executable(test_rail_affinity io/test_rail_affinity.cpp)
 
-target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_topology mori_application mori_io)
+  target_include_directories(test_rail_affinity
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_rail_affinity PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_rail_affinity mori_application mori_io numa)
+
+  add_executable(test_engine io/test_engine.cpp)
+
+  target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_engine mori_application mori_io)
+
+  add_executable(test_transfer_wait io/test_transfer_wait.cpp)
+
+  target_include_directories(test_transfer_wait
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_transfer_wait PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_transfer_wait mori_application mori_io)
+
+  add_executable(test_topology application/test_topology.cpp)
+
+  target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_topology mori_application mori_io)
+
+  add_executable(test_discrete_buffer io/test_discrete_buffer.cpp)
+  set_source_files_properties(io/test_discrete_buffer.cpp PROPERTIES LANGUAGE
+                                                                     HIP)
+
+  target_include_directories(test_discrete_buffer
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_discrete_buffer PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_discrete_buffer hip::host hip::device)
+  if(DEFINED GPU_TARGETS)
+    set_target_properties(test_discrete_buffer PROPERTIES HIP_ARCHITECTURES
+                                                          "${GPU_TARGETS}")
+  endif()
+endif()
+
+if(BUILD_OPS_DEVICE AND WITH_MPI)
+  find_package(MPI REQUIRED)
+  add_executable(test_aot_launch ops/test_aot_launch.cpp)
+  target_include_directories(test_aot_launch PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_aot_launch PUBLIC ${CMAKE_SOURCE_DIR})
+  target_include_directories(test_aot_launch PUBLIC ${MPI_CXX_INCLUDE_DIRS})
+  target_link_libraries(test_aot_launch mori_ops mori_shmem mori_application
+                        hip::host ${MPI_CXX_LIBRARIES})
+endif()
+
+if(BUILD_UMBP)
+  add_subdirectory(umbp)
+endif()
+
+if(BUILD_METRICS)
+  add_subdirectory(metrics)
+endif()

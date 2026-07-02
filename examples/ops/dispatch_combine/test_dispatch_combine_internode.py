@@ -28,7 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -36,6 +36,234 @@ kernel_type_map = {
     "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
     "async_ll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
 }
+
+_CLI_TO_KERNEL_TYPE_NAME = {
+    "v0": "InterNode",
+    "v1": "InterNodeV1",
+    "v1_ll": "InterNodeV1LL",
+    "async_ll": "AsyncLL",
+}
+
+_FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
+
+# Bandwidth improvement must exceed this margin (GB/s) to update the best
+# config during tuning. Prevents config churn from run-to-run noise.
+_BW_NOISE_MARGIN = 1.0
+
+
+def _is_fp4x2_dtype(dtype):
+    return _FP4_DTYPE is not None and dtype is _FP4_DTYPE
+
+
+_FP4_E2M1_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def unpack_fp4x2(fp4x2_tensor, dtype=torch.bfloat16):
+    """Unpack float4_e2m1fn_x2 tensor [*, H] to float [*, H*2]."""
+    raw = fp4x2_tensor.view(torch.uint8)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    lut = torch.tensor(_FP4_E2M1_LUT, dtype=dtype, device=raw.device)
+    result = torch.stack([lut[low.long()], lut[high.long()]], dim=-1)
+    return result.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
+
+
+def _save_internode_tuning_result(
+    config_path,
+    config,
+    max_num_token,
+    dispatch_hidden_dim,
+    combine_hidden_dim,
+    combine_data_type,
+    best_disp_config,
+    best_disp_bw,
+    best_comb_config,
+    best_comb_bw,
+    best_disp_all_bw=None,  # dict with rdma/xgmi/ll/lat stats or None
+    best_comb_all_bw=None,
+):
+    from pathlib import Path
+    from mori.ops.tuning_config import (
+        TuningConfigManager,
+        dtype_to_config_str,
+        build_config_filename,
+        quant_type_to_config_str,
+        kernel_type_to_config_str,
+        detect_gpu_model,
+    )
+    from mori.jit.config import detect_gpu_arch
+
+    gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
+    kernel_type_name = kernel_type_to_config_str(config.kernel_type)
+    disp_dtype_str = dtype_to_config_str(config.data_type)
+    comb_dtype_str = dtype_to_config_str(combine_data_type)
+    qt_str = quant_type_to_config_str(config.quant_type)
+
+    metadata = {
+        "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
+        "kernel_type": kernel_type_name,
+        "ep_size": config.world_size,
+    }
+
+    def _stats_avg(stats, key):
+        return stats[key][2] if stats else 0.0
+
+    dispatch_entry = {
+        "dtype": disp_dtype_str,
+        "num_tokens": max_num_token,
+        "hidden_dim": dispatch_hidden_dim,
+        "block_num": best_disp_config[0],
+        "rdma_block_num": best_disp_config[2],
+        "warp_per_block": best_disp_config[1],
+        "bandwidth_gbps": round(best_disp_bw, 2),
+        "avg_rdma_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "rdma"), 2),
+        "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "xgmi"), 2),
+        "avg_ll_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "ll"), 2),
+        "avg_latency_us": round(_stats_avg(best_disp_all_bw, "lat"), 2),
+    }
+
+    combine_entry = {
+        "dtype": comb_dtype_str,
+        "num_tokens": max_num_token,
+        "hidden_dim": combine_hidden_dim,
+        "zero_copy": False,
+        "quant_type": qt_str,
+        "block_num": best_comb_config[0],
+        "rdma_block_num": best_comb_config[2],
+        "warp_per_block": best_comb_config[1],
+        "bandwidth_gbps": round(best_comb_bw, 2),
+        "avg_rdma_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "rdma"), 2),
+        "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "xgmi"), 2),
+        "avg_ll_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "ll"), 2),
+        "avg_latency_us": round(_stats_avg(best_comb_all_bw, "lat"), 2),
+    }
+
+    if config_path == "auto":
+        repo_tuning_dir = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "mori"
+            / "ops"
+            / "tuning_configs"
+        )
+        dispatch_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                kernel_type_name,
+                config.world_size,
+                gpu_model,
+                "dispatch",
+            )
+        )
+        combine_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                kernel_type_name,
+                config.world_size,
+                gpu_model,
+                "combine",
+            )
+        )
+    else:
+        base = config_path.rsplit(".", 1)[0] if "." in config_path else config_path
+        dispatch_path = f"{base}_dispatch.json"
+        combine_path = f"{base}_combine.json"
+
+    dispatch_metadata = {**metadata, "phase": "dispatch"}
+    combine_metadata = {**metadata, "phase": "combine"}
+
+    TuningConfigManager.save_tuning_result(
+        dispatch_path,
+        dispatch_metadata,
+        dispatch_entry,
+        phase="dispatch",
+    )
+    TuningConfigManager.save_tuning_result(
+        combine_path,
+        combine_metadata,
+        combine_entry,
+        phase="combine",
+    )
+    print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
+
+
+def compute_rdma_algo_token_count(
+    topk_idx: torch.Tensor,
+    num_experts_per_rank: int,
+    gpu_per_node: int,
+    world_size: int,
+    kernel_type=None,
+) -> int:
+    """Compute the RDMA algorithm token count using the same method as DeepEP.
+
+    DeepEP (test_internode.py lines 58-61) defines the RDMA bandwidth numerator as
+    the total number of (token, destination-node) pairs emitted by this rank,
+    counting the local node too.  This is the "algorithm bandwidth" figure — the
+    physical cross-node count is (num_nodes - 1) / num_nodes of this value.
+
+    For the v1_ll kernel, no deduplication is performed across expert slots, so
+    each token contributes one entry per node (num_token_per_rank * num_nodes).
+
+    Args:
+        topk_idx:            [T, K] int32 tensor of global expert IDs for this rank's
+                             tokens (as produced by gen_test_data; no -1 entries).
+        num_experts_per_rank: from EpDispatchCombineConfig.
+        gpu_per_node:        GPUs per node.
+        world_size:          total number of ranks.
+        kernel_type:         EpDispatchCombineKernelType (optional).  When set to
+                             InterNodeV1LL the count is num_token * num_nodes
+                             (no dedup); otherwise the deduplicating DeepEP
+                             formula is used.
+
+    Returns:
+        Integer count of (token, destination-node) pairs, equivalent to
+        DeepEP's ``rdma_idx.ne(-1).sum().item()``.
+    """
+    num_nodes = world_size // gpu_per_node
+
+    # v1_ll does not deduplicate across expert slots in the kernel, so every
+    # token contributes one entry for every node unconditionally.
+    if kernel_type == mori.ops.EpDispatchCombineKernelType.InterNodeV1LL:
+        return topk_idx.shape[0] * num_nodes
+
+    num_experts_per_node = num_experts_per_rank * gpu_per_node
+
+    # Map each selected expert to the node that owns it — mirrors DeepEP:
+    #   rdma_idx = topk_idx // (num_experts // num_nodes)
+    node_idx = (topk_idx // num_experts_per_node).long()  # [T, K]
+
+    # Mark which nodes are visited by each token (deduplicates across the K
+    # expert slots) — vectorised equivalent of DeepEP's inplace_unique followed
+    # by ne(-1).sum():
+    #   inplace_unique(rdma_idx, num_nodes)
+    #   num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
+    node_presence = torch.zeros(
+        topk_idx.shape[0], num_nodes, dtype=torch.bool, device=topk_idx.device
+    )
+    node_presence.scatter_(1, node_idx, True)  # [T, num_nodes]
+
+    return node_presence.sum().item()
 
 
 class EpDispatchCombineTestCase:
@@ -50,21 +278,37 @@ class EpDispatchCombineTestCase:
         quant_type="none",
         dtype=torch.bfloat16,
         hidden_dim=7168,
+        combine_dtype=None,
+        max_total_recv_tokens=0,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
+
+        self.dispatch_data_type = dtype
+        self.combine_data_type = combine_dtype if combine_dtype is not None else dtype
+        self.dispatch_hidden_dim = (
+            hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim
+        )
+        if _is_fp4x2_dtype(dtype) and not _is_fp4x2_dtype(self.combine_data_type):
+            self.combine_hidden_dim = self.dispatch_hidden_dim * 2
+        elif not _is_fp4x2_dtype(dtype) and _is_fp4x2_dtype(self.combine_data_type):
+            self.combine_hidden_dim = self.dispatch_hidden_dim // 2
+        else:
+            self.combine_hidden_dim = self.dispatch_hidden_dim
+
+        assert (
+            256 % self.world_size == 0
+        ), f"world_size={self.world_size} must divide 256 (total experts)"
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=(
-                hidden_dim // 2 if dtype is torch.float4_e2m1fn_x2 else hidden_dim
-            ),
+            hidden_dim=max(self.dispatch_hidden_dim, self.combine_hidden_dim),
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
-            num_experts_per_rank=16,
+            max_num_inp_token_per_rank=max_tokens,
+            num_experts_per_rank=256 // self.world_size,
             num_experts_per_token=8,
             warp_num_per_block=8,
             block_num=96,
@@ -74,6 +318,7 @@ class EpDispatchCombineTestCase:
             rdma_block_num=64,
             num_qp_per_pe=num_qp,
             quant_type=quant_type,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
 
     def setup(self):
@@ -135,7 +380,16 @@ class EpDispatchCombineTestCase:
         dist.all_gather(output, padded_input)
         return output
 
-    def gen_test_data(self, max_num_token, use_max_token_num=False):
+    def gen_test_data(
+        self,
+        max_num_token,
+        use_max_token_num=False,
+        only_my_rank=False,
+        sentinel_pattern=None,
+    ):
+        hidden_dim = self.dispatch_hidden_dim
+        keep_ranks = {self.rank} if only_my_rank else set(range(self.world_size))
+
         # gen num_tokens
         if use_max_token_num:
             num_token = torch.tensor(
@@ -152,88 +406,93 @@ class EpDispatchCombineTestCase:
 
         # gen indices - vectorized version for speed
         num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        all_rank_indices = []
+        all_rank_indices = [None] * self.world_size
         for r in range(self.world_size):
             num_tok = num_token[r].item()
-            # Generate random floats and use argsort to get permutations
-            # This is much faster than calling randperm in a loop
             random_vals = torch.rand(
                 num_tok,
                 num_total_experts,
                 generator=self.rng,
                 device=self.device,
             )
-            # argsort gives us a random permutation, take first K columns
             indices = torch.argsort(random_vals, dim=1)[
                 :, : self.config.num_experts_per_token
             ]
-            all_rank_indices.append(indices.to(torch.int32))
-
-        # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        # num_nodes = self.config.world_size // self.config.gpu_per_node
-
-        # even_indices = (
-        #     torch.arange(
-        #         max_num_token
-        #         * self.config.num_experts_per_token,
-        #         device="cuda",
-        #     ).view(
-        #         max_num_token,
-        #         self.config.num_experts_per_token,
-        #     )
-        #     % 256
-        # )
-        # even_indices = even_indices.to(torch.int32)
-        # all_rank_indices = [even_indices for _ in range(self.world_size)]
+            if sentinel_pattern is not None and num_tok > 0:
+                k = self.config.num_experts_per_token
+                if sentinel_pattern == "every_other":
+                    sentinel_slots = list(range(1, k, 2))
+                elif sentinel_pattern == "first_only":
+                    sentinel_slots = list(range(1, k))
+                elif isinstance(sentinel_pattern, int):
+                    assert (
+                        0 <= sentinel_pattern < k
+                    ), f"sentinel_pattern={sentinel_pattern} must be in [0, k={k})"
+                    sentinel_slots = list(range(k - sentinel_pattern, k))
+                else:
+                    raise ValueError(f"Unknown sentinel_pattern: {sentinel_pattern!r}")
+                for j in sentinel_slots:
+                    indices[:, j] = -1
+            if r in keep_ranks:
+                all_rank_indices[r] = indices.to(torch.int32)
+            del random_vals, indices
 
         # gen weights
-        all_rank_weights = [
-            torch.rand(
+        all_rank_weights = [None] * self.world_size
+        for r in range(self.world_size):
+            w = torch.rand(
                 num_token[r],
                 self.config.num_experts_per_token,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            for r in range(self.world_size)
-        ]
+            if r in keep_ranks:
+                all_rank_weights[r] = w
+            else:
+                del w
 
         # gen scales
-        all_rank_scales = [
-            torch.rand(
+        all_rank_scales = [None] * self.world_size
+        for r in range(self.world_size):
+            s = torch.rand(
                 num_token[r],
                 self.config.scale_dim,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            for r in range(self.world_size)
-        ]
+            if r in keep_ranks:
+                all_rank_scales[r] = s
+            else:
+                del s
 
-        # gen input & output
-        # some functions such as randn and cat are not implemented for fp8
-        all_rank_input = []
+        all_rank_input = [None] * self.world_size
         for r in range(self.world_size):
             data_fp32 = torch.randn(
                 num_token[r],
-                self.config.hidden_dim,
+                hidden_dim,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            if self.config.data_type is torch.float4_e2m1fn_x2:
+            if _is_fp4x2_dtype(self.dispatch_data_type):
                 data = torch.randint(
                     0,
                     256,
-                    (num_token[r], self.config.hidden_dim),
+                    (num_token[r], hidden_dim),
                     dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
                 )
-                data = data.view(torch.float4_e2m1fn_x2)
+                data = data.view(_FP4_DTYPE)
             else:
-                data = data_fp32.to(self.config.data_type)
-            all_rank_input.append(data)
+                data = data_fp32.to(self.dispatch_data_type)
+            del data_fp32
+            if r in keep_ranks:
+                all_rank_input[r] = data
+            else:
+                del data
 
         return (
             num_token,
@@ -242,6 +501,14 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         )
+
+    def _convert_for_combine(self, dispatch_output):
+        """Convert dispatch output to combine dtype if cross-type."""
+        if self.combine_data_type == self.dispatch_data_type:
+            return dispatch_output
+        if _is_fp4x2_dtype(self.dispatch_data_type):
+            return unpack_fp4x2(dispatch_output, dtype=self.combine_data_type)
+        return dispatch_output.to(self.combine_data_type)
 
     def count_token_num(self, all_rank_indices):
         # Per-rank counts
@@ -258,20 +525,18 @@ class EpDispatchCombineTestCase:
         for src_rank, indices in enumerate(all_rank_indices):
             src_node = src_rank // self.config.gpu_per_node
 
-            # Map expert IDs to rank IDs
-            token_ranks = (
-                indices // self.config.num_experts_per_rank
-            )  # [num_tokens, num_experts_per_token]
+            # Per token, map valid expert IDs to destination ranks (skip -1 sentinels).
+            for row in indices:
+                valid_experts = row[row >= 0]
+                if valid_experts.numel() == 0:
+                    continue
+                ur = torch.unique(valid_experts // self.config.num_experts_per_rank)
 
-            # Deduplicate rank IDs per token
-            unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
-
-            # For each token, update counts
-            for ur in unique_ranks_per_token:
                 rank_counts[ur] += 1  # All ranks that receive this token
 
                 dst_nodes = {
-                    dst_rank // self.config.gpu_per_node for dst_rank in ur.tolist()
+                    int(dst_rank // self.config.gpu_per_node)
+                    for dst_rank in ur.tolist()
                 }
 
                 for dst_rank in ur.tolist():
@@ -287,25 +552,71 @@ class EpDispatchCombineTestCase:
 
         if self.config.rank == 0:
             print("Rank counts (deduplicated):", rank_counts)
-            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
-            # print("Rank counts from other nodes:", rank_counts_remote_recv)
-            # print("Rank counts to other nodes:", rank_counts_remote_send)
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
-    def run_dispatch(self, op, token, weights, scales, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
-            ret = op.dispatch_send(token, weights, scales, indices)
-            op.dispatch_recv()
+    def run_dispatch(
+        self,
+        op,
+        token,
+        weights,
+        scales,
+        indices,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
+            ret = op.dispatch(
+                token,
+                weights,
+                scales,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
+            op.dispatch_recv(block_num=block_num, warp_per_block=warp_per_block)
         else:
-            ret = op.dispatch(token, weights, scales, indices)
+            ret = op.dispatch(
+                token,
+                weights,
+                scales,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
         return ret
 
-    def run_combine(self, op, token, weights, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
-            ret = op.combine_send(token, weights, indices)
-            op.combine_recv()
+    def run_combine(
+        self,
+        op,
+        token,
+        weights,
+        indices,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
+            ret = op.combine(
+                token,
+                weights,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
+            op.combine_recv(block_num=block_num, warp_per_block=warp_per_block)
         else:
-            ret = op.combine(token, weights, indices)
+            ret = op.combine(
+                token,
+                weights,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
         return ret
 
     def run_test_once(self, op, test_data, error_round, round):
@@ -335,7 +646,7 @@ class EpDispatchCombineTestCase:
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
-        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
+        # max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         recv_token_num = len(src_token_pos)
 
         # Check recv token num
@@ -349,9 +660,8 @@ class EpDispatchCombineTestCase:
 
         # Check token equality
         for i, src_token_id in enumerate(src_token_pos):
-            src_pe = src_token_id // max_num_token_to_send_per_rank
-            src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            if self.config.data_type is torch.float4_e2m1fn_x2:
+            src_pe, src_tok_id = op.decode_send_flat_idx(src_token_id)
+            if _is_fp4x2_dtype(self.config.data_type):
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
                     all_rank_input[src_pe][src_tok_id].view(torch.uint8),
@@ -365,7 +675,6 @@ class EpDispatchCombineTestCase:
                     f"rank {self.rank} token {i} assert {is_pass} expected {all_rank_input[src_pe][src_tok_id].view(torch.uint8)} got {dispatch_output[i].view(torch.uint8)}"
                 )
                 assert False
-                # error_round.add(round)
             if dispatch_weights is not None:
                 assert torch.equal(
                     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
@@ -379,19 +688,21 @@ class EpDispatchCombineTestCase:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
         # NOTE: weight combine not implemented yet
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             dispatch_weights = None
+        combine_input = self._convert_for_combine(dispatch_output)
         combine_output, combine_output_weight = self.run_combine(
-            op, dispatch_output, dispatch_weights, all_rank_indices[self.rank]
+            op, combine_input, dispatch_weights, all_rank_indices[self.rank]
         )
-
         torch.cuda.synchronize()
+        combine_data_type = self.combine_data_type
         for i in range(all_rank_num_token[self.rank]):
-            if self.config.data_type is torch.float4_e2m1fn_x2:
+            if _is_fp4x2_dtype(combine_data_type):
                 continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.rank][i].cpu().tolist()
+                if idx >= 0
             ]
             unique_pes = len(set(pes))
             unique_innode_pes = len(
@@ -405,13 +716,30 @@ class EpDispatchCombineTestCase:
             if final_unique_pes == 0:
                 continue
 
-            got, expected = combine_output[i], (
-                all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
-            ).to(self.config.data_type)
+            inp = all_rank_input[self.rank][i]
+            if _is_fp4x2_dtype(self.dispatch_data_type):
+                inp_converted = unpack_fp4x2(
+                    inp.unsqueeze(0), dtype=combine_data_type
+                ).squeeze(0)
+            else:
+                inp_converted = inp.to(combine_data_type)
+
+            got, expected = (
+                combine_output[i],
+                (inp_converted.to(torch.float32) * final_unique_pes).to(
+                    combine_data_type
+                ),
+            )
 
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
+            if combine_data_type in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                atol = max(atol, 2.0 * final_unique_pes)
+                rtol = max(rtol, 0.15)
             ok = torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
             if not ok:
                 print(
@@ -425,9 +753,6 @@ class EpDispatchCombineTestCase:
                     expected,
                     all_rank_input[self.rank][i],
                 )
-                # delta = got.float() - expected.float()
-                # print(self.rank, "delta:", delta)
-                # error_round.add(round)
                 assert False
                 # pass
 
@@ -483,10 +808,40 @@ class EpDispatchCombineTestCase:
 
         del op
 
+    def test_sentinel_dispatch_combine(
+        self, sentinel_pattern="every_other", num_rounds=50
+    ):
+        """Default-path dispatch/combine with -1 routing sentinel expert IDs."""
+        # -1 sentinel skipping is implemented for IntraNode and InterNodeV1 only.
+        if self.config.kernel_type != mori.ops.EpDispatchCombineKernelType.InterNodeV1:
+            if self.rank == 0:
+                print(
+                    "test_sentinel_dispatch_combine: skipping kernel without "
+                    f"-1 sentinel support ({self.config.kernel_type})"
+                )
+            return
+        error_round = set()
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        for i in range(num_rounds):
+            if self.rank == 0:
+                print(f"Sentinel round {i} begin (pattern={sentinel_pattern!r})")
+            test_data = self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+                sentinel_pattern=sentinel_pattern,
+            )
+            self.run_test_once(op, test_data, error_round, i)
+        if self.rank == 0:
+            print(
+                f"Sentinel test done: {len(error_round)} failing rounds out of {num_rounds}"
+            )
+        del op
+
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         num_test_data = 128
         sync_interval = 128
+        is_cross_type = self.combine_data_type != self.dispatch_data_type
 
         if self.rank == 0:
             print("Stress Test")
@@ -518,55 +873,71 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
             )
+            combine_input = self._convert_for_combine(dispatch_output)
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op, combine_input, None, all_rank_indices[self.rank]
             )
             if i % sync_interval == 0:
                 torch.cuda.synchronize()
         torch.cuda.synchronize()
 
-        if self.rank == 0:
-            print("Stress Test with CUDA Graph")
-        test_data = self.gen_test_data(
-            max_num_token=self.config.max_num_inp_token_per_rank,
-            use_max_token_num=False,
-        )
-        (
-            all_rank_num_token,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
-        ) = test_data
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        if is_cross_type:
+            if self.rank == 0:
+                print(
+                    "Skipping CUDA Graph stress test (cross-type not supported in graph)"
+                )
+        else:
+            if self.rank == 0:
+                print("Stress Test with CUDA Graph")
+            test_data = self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+            )
             (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = self.run_dispatch(
-                op,
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-            )
-            combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
-            )
-        torch.cuda.synchronize()
-
-        for i in tqdm(range(5000)):
-            g.replay()
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = self.run_dispatch(
+                    op,
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                )
+                combine_output, combine_output_weight = self.run_combine(
+                    op, dispatch_output, None, all_rank_indices[self.rank]
+                )
             torch.cuda.synchronize()
-            time.sleep(0.0001)
+
+            for i in tqdm(range(5000)):
+                g.replay()
+                torch.cuda.synchronize()
+                time.sleep(0.0001)
 
         del op
 
-    def run_bench_once(self, max_num_token, op, test_data, repeat=10):
-        num_events = 2 * repeat + 1
+    def run_bench_once(
+        self,
+        max_num_token,
+        op,
+        test_data,
+        repeat=10,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
+        num_events = 3 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
 
         (
@@ -591,27 +962,40 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
             if i == warmup_rounds - 1:
-                # Read totalRecvTokenNum after dispatch but before combine resets it
                 torch.cuda.synchronize()
                 total_recv_num_token = dispatch_recv_num_token[0].item()
+            combine_input = self._convert_for_combine(dispatch_output)
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                combine_input,
+                None,
+                all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
             torch.cuda.synchronize()
-        total_rdma_recv_num_token = (
-            self.config.max_num_inp_token_per_rank * self.config.world_size // 8
+        total_rdma_recv_num_token = compute_rdma_algo_token_count(
+            topk_idx=all_rank_indices[self.rank],
+            num_experts_per_rank=self.config.num_experts_per_rank,
+            gpu_per_node=self.config.gpu_per_node,
+            world_size=self.config.world_size,
+            kernel_type=op.config.kernel_type,
         )
         print(
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
-            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times = op.get_debug_time_buf()
             my_times.zero_()
             if hasattr(mori.cpp, "get_debug_time_offset"):
-                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets = op.get_debug_time_offset()
                 my_offsets.zero_()
 
         torch.cuda.synchronize()
@@ -630,50 +1014,88 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
-            events[2 * i + 1].record()
+            events[3 * i + 1].record()
+            combine_input = self._convert_for_combine(dispatch_output)
+            events[3 * i + 2].record()
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                combine_input,
+                None,
+                all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
-            events[2 * i + 2].record()
+            events[3 * i + 3].record()
         torch.cuda.synchronize()
 
-        element_size = all_rank_input[self.rank].element_size()
-        total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        disp_element_size = all_rank_input[self.rank].element_size()
+        disp_total_bytes = (
+            total_recv_num_token * self.dispatch_hidden_dim * disp_element_size
+        )
+        comb_element_size = torch.tensor(
+            [], dtype=self.combine_data_type
+        ).element_size()
+        comb_total_bytes = (
+            total_recv_num_token * self.combine_hidden_dim * comb_element_size
+        )
         ll_mode_scale = (
             max_num_token
             * self.config.num_experts_per_token
-            / (total_recv_num_token + 1)  # avoid division by zero
+            / (total_recv_num_token + 1)
         )
-        total_rdma_bytes = (
-            total_rdma_recv_num_token * self.config.hidden_dim * element_size
+        disp_total_rdma_bytes = (
+            total_rdma_recv_num_token * self.dispatch_hidden_dim * disp_element_size
+        )
+        comb_total_rdma_bytes = (
+            total_rdma_recv_num_token * self.combine_hidden_dim * comb_element_size
         )
 
         disp_duration_list = []
         comb_duration_list = []
-        for i in range(1, num_events, 2):
-            disp_duration_list.append(events[i - 1].elapsed_time(events[i]))
-            comb_duration_list.append(events[i].elapsed_time(events[i + 1]))
+        for i in range(repeat):
+            disp_duration_list.append(events[3 * i].elapsed_time(events[3 * i + 1]))
+            comb_duration_list.append(events[3 * i + 2].elapsed_time(events[3 * i + 3]))
 
         disp_rdma_bandwidth_list = [
-            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+            disp_total_rdma_bytes / (1000**3) / (t / (10**3))
+            for t in disp_duration_list
         ]
         disp_bandwidth_list = [
-            total_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+            disp_total_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
         ]
 
         comb_rdma_bandwidth_list = [
-            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+            comb_total_rdma_bytes / (1000**3) / (t / (10**3))
+            for t in comb_duration_list
         ]
         comb_bandwidth_list = [
-            total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+            comb_total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
             output_filename = (
                 f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
             )
-            mori.kernel_profiler.export_to_perfetto(my_times, output_filename)
+            # Select per-kernel slot map to avoid collision: InternodeV1 and
+            # LowLatencyAsync both define enums starting from 0, so ALL_PROFILER_SLOTS
+            # (which merges them) has low_latency_async.* overwriting internode_v1.*
+            # for slot IDs 0-9. Pass the correct per-kernel map explicitly.
+            kt = self.config.kernel_type
+            KT = mori.ops.EpDispatchCombineKernelType
+            if kt in (KT.InterNode, KT.InterNodeV1, KT.InterNodeV1LL):
+                slot_map = getattr(mori.cpp, "InternodeV1Slots", None)
+            elif kt == KT.AsyncLL:
+                slot_map = getattr(mori.cpp, "LowLatencyAsyncSlots", None)
+            else:
+                slot_map = None
+            mori.kernel_profiler.export_to_perfetto(
+                my_times, output_filename, slot_map=slot_map
+            )
             if self.rank == 0:
                 print(f"Profiling data exported to {output_filename}")
 
@@ -687,203 +1109,386 @@ class EpDispatchCombineTestCase:
             ll_mode_scale,
         )
 
-    def bench_dispatch_combine(self, max_num_token):
+    def bench_dispatch_combine(
+        self,
+        max_num_token,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+        skip_verify=False,
+    ):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
-            max_num_token=max_num_token, use_max_token_num=True
+            max_num_token=max_num_token,
+            use_max_token_num=True,
+            only_my_rank=skip_verify,
         )
 
         repeat = 10
-        disp_duration_us_list = []
-        disp_rdma_bandwidth_GB_list = []
-        disp_bandwidth_GB_list = []
-        comb_duration_us_list = []
-        comb_rdma_bandwidth_GB_list = []
-        comb_bandwidth_GB_list = []
 
-        error_round = set()
-        for i in range(1):
-            if self.rank == 0:
-                print(f"WarmUp Round {i} begin")
-            self.run_test_once(op, test_data, error_round, i)
-        assert (
-            len(error_round) == 0
-        ), f"Warmup failed with errors in rounds: {error_round}"
+        if not skip_verify:
+            error_round = set()
+            for i in range(1):
+                if self.rank == 0:
+                    print(f"WarmUp Round {i} begin")
+                self.run_test_once(op, test_data, error_round, i)
+            assert (
+                len(error_round) == 0
+            ), f"Warmup failed with errors in rounds: {error_round}"
 
-        (
-            disp_duration,
-            disp_rdma_bandwidth,
-            disp_bandwidth,
-            comb_duration,
-            comb_rdma_bandwidth,
-            comb_bandwidth,
-            ll_mode_scale,
-        ) = self.run_bench_once(max_num_token, op, test_data, repeat)
-
-        for i in range(repeat):
-            disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
-            disp_rdma_bandwidth_output = [
-                torch.zeros(1) for _ in range(self.world_size)
-            ]
-            disp_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
-            comb_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
-            comb_rdma_bandwidth_output = [
-                torch.zeros(1) for _ in range(self.world_size)
-            ]
-            comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
-
-            dist.all_gather(
-                disp_duration_output, torch.tensor([disp_duration[i] * 1000])
-            )
-            dist.all_gather(
-                disp_rdma_bandwidth_output, torch.tensor([disp_rdma_bandwidth[i]])
-            )
-            dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth[i]]))
-            dist.all_gather(
-                comb_duration_output, torch.tensor([comb_duration[i] * 1000])
-            )
-            dist.all_gather(
-                comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth[i]])
-            )
-            dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth[i]]))
-
-            disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
-            disp_rdma_bandwidth_GB_list.append(
-                [int(t.item()) for t in disp_rdma_bandwidth_output]
-            )
-            disp_bandwidth_GB_list.append(
-                [int(t.item()) for t in disp_bandwidth_output]
-            )
-            comb_duration_us_list.append([int(t.item()) for t in comb_duration_output])
-            comb_rdma_bandwidth_GB_list.append(
-                [int(t.item()) for t in comb_rdma_bandwidth_output]
-            )
-            comb_bandwidth_GB_list.append(
-                [int(t.item()) for t in comb_bandwidth_output]
-            )
+        bench_result = self.run_bench_once(
+            max_num_token,
+            op,
+            test_data,
+            repeat,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
+        ll_mode_scale = bench_result[-1]
+        all_data, _ = self._all_gather_bench_data(bench_result)
+        # all_data: (repeat, world_size, 6)
+        # cols: d_rdma(0) d_xgmi(1) d_lat(2) c_rdma(3) c_xgmi(4) c_lat(5)
 
         if self.rank == 0:
-            for i in range(len(disp_duration_us_list)):
-                print(f"Round {i}")
-                print(
-                    f"  dispatch duration {disp_duration_us_list[i]} avg {sum(disp_duration_us_list[i]) / self.config.world_size:.2f} µs"
-                )
-                print(
-                    f"  rdma bandwidth {disp_rdma_bandwidth_GB_list[i]} avg {sum(disp_rdma_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-                print(
-                    f"  bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-
-            for i in range(len(comb_duration_us_list)):
-                print(f"Round {i}")
-                print(
-                    f"  combine duration {comb_duration_us_list[i]} avg {sum(comb_duration_us_list[i]) / self.config.world_size:.2f} µs"
-                )
-                print(
-                    f"  rdma bandwidth {comb_rdma_bandwidth_GB_list[i]} avg {sum(comb_rdma_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-                print(
-                    f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
+            _labels = [
+                (
+                    "dispatch",
+                    (
+                        ("duration", 2, "µs"),
+                        ("rdma bandwidth", 0, "GB/s"),
+                        ("bandwidth", 1, "GB/s"),
+                    ),
+                ),
+                (
+                    "combine",
+                    (
+                        ("duration", 5, "µs"),
+                        ("rdma bandwidth", 3, "GB/s"),
+                        ("bandwidth", 4, "GB/s"),
+                    ),
+                ),
+            ]
+            for phase, cols in _labels:
+                for i in range(all_data.shape[0]):
+                    rd = all_data[i]
+                    if cols is _labels[0][1]:
+                        print(f"Round {i}")
+                    for name, col, unit in cols:
+                        print(
+                            f"  {phase} {name} {rd[:, col].int().tolist()}"
+                            f" avg {rd[:, col].mean():.2f} {unit}"
+                        )
 
         if repeat == 1:
             return
 
-        def collect_metrics(per_round_data):
-            minv = min([min(data) for data in per_round_data])
-            maxv = max([max(data) for data in per_round_data])
-            avgl = [(sum(data) / len(data)) for data in per_round_data]
-            avgv = sum(avgl) / len(avgl)
-            return int(minv), int(maxv), int(avgv)
+        kept = all_data[1:]  # skip round 0
+        disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_mode_scale)
+        comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_mode_scale)
 
-        disp_bw = collect_metrics(disp_bandwidth_GB_list[1:])
-        disp_rdma_bw = collect_metrics(disp_rdma_bandwidth_GB_list[1:])
-        disp_ll_bw = [int(e * ll_mode_scale) for e in disp_bw]
-        disp_lat = collect_metrics(disp_duration_us_list[1:])
+        disp_dtype_str = str(self.config.data_type).split(".")[-1]
+        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+        disp_title = f"Dispatch Performance ({disp_dtype_str})"
+        comb_title = f"Combine Performance ({comb_dtype_str})"
+        if self.combine_data_type != self.config.data_type:
+            disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
+            comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
+            disp_title += f" ~{max_num_token * self.dispatch_hidden_dim * disp_elem / (1024**2):.1f} MB/rank"
+            comb_title += f" ~{max_num_token * self.combine_hidden_dim * comb_elem / (1024**2):.1f} MB/rank"
 
-        comb_bw = collect_metrics(comb_bandwidth_GB_list[1:])
-        comb_rdma_bw = collect_metrics(comb_rdma_bandwidth_GB_list[1:])
-        comb_ll_bw = [int(e * ll_mode_scale) for e in comb_bw]
-        comb_lat = collect_metrics(comb_duration_us_list[1:])
+        if self.rank == 0:
+            self._print_phase_table(disp_title, disp_stats)
+            self._print_phase_table(comb_title, comb_stats)
 
+        del op
+
+        def _to_int_tuple(s):
+            return tuple(round(v, 2) for v in s)
+
+        return (
+            _to_int_tuple(disp_stats["xgmi"]),
+            _to_int_tuple(disp_stats["rdma"]),
+            _to_int_tuple(disp_stats["ll"]),
+            _to_int_tuple(disp_stats["lat"]),
+        ), (
+            _to_int_tuple(comb_stats["xgmi"]),
+            _to_int_tuple(comb_stats["rdma"]),
+            _to_int_tuple(comb_stats["ll"]),
+            _to_int_tuple(comb_stats["lat"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Shared bench data collection — used by both bench and tuning
+    # ------------------------------------------------------------------
+
+    def _build_phase_stats(self, kept, col_rdma, col_xgmi, col_lat, ll_scale):
+        """Compute (worst, best, avg) stats for one phase from gathered data.
+
+        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg) tuple.
+        Uses the same ``_compute_stats`` as PrettyTable, so values are identical.
+        """
+        _s = self._compute_stats
+        xgmi_s = _s(kept[:, :, col_xgmi])
+        return {
+            "rdma": _s(kept[:, :, col_rdma]),
+            "xgmi": xgmi_s,
+            "ll": tuple(v * ll_scale for v in xgmi_s),
+            "lat": _s(kept[:, :, col_lat]),
+        }
+
+    @staticmethod
+    def _print_phase_table(title, stats):
+        """Print a PrettyTable for one phase from stats dict."""
         from prettytable import PrettyTable
 
-        disp_table = PrettyTable()
-        comb_table = PrettyTable()
-        field_names = [
+        def _i(s):
+            return tuple(round(v, 2) for v in s)
+
+        tbl = PrettyTable()
+        tbl.title = title
+        tbl.field_names = [
             "Metrics",
             "RDMA Bandwidth (GB/s)",
             "XGMI Bandwidth (GB/s)",
             "LL Bandwidth (GB/s)",
             "Latency (us)",
         ]
-        disp_table.title = "Dispatch Performance"
-        disp_table.field_names = field_names
-        disp_table.add_rows(
+        rdma, xgmi, ll, lat = (
+            _i(stats["rdma"]),
+            _i(stats["xgmi"]),
+            _i(stats["ll"]),
+            _i(stats["lat"]),
+        )
+        tbl.add_rows(
             [
-                [
-                    "Best",
-                    disp_rdma_bw[1],
-                    disp_bw[1],
-                    disp_ll_bw[1],
-                    disp_lat[0],
-                ],
-                [
-                    "Worst",
-                    disp_rdma_bw[0],
-                    disp_bw[0],
-                    disp_ll_bw[0],
-                    disp_lat[1],
-                ],
-                [
-                    "Average",
-                    disp_rdma_bw[2],
-                    disp_bw[2],
-                    disp_ll_bw[2],
-                    disp_lat[2],
-                ],
+                ["Best", rdma[1], xgmi[1], ll[1], lat[0]],
+                ["Worst", rdma[0], xgmi[0], ll[0], lat[1]],
+                ["Average", rdma[2], xgmi[2], ll[2], lat[2]],
             ]
         )
-        comb_table.field_names = field_names
-        comb_table.title = "Combine Performance"
-        comb_table.add_rows(
-            [
+        print(tbl)
+
+    _GATHER_COLS = (
+        "disp_rdma",
+        "disp_xgmi",
+        "disp_lat",
+        "comb_rdma",
+        "comb_xgmi",
+        "comb_lat",
+    )
+
+    def _all_gather_bench_data(self, bench_result):
+        """Per-iteration all_gather from all ranks (packed into one call per round).
+
+        Returns (data, ll_mode_scale) where *data* has shape
+        ``(repeat, world_size, 6)`` with full float64 precision and columns
+        [disp_rdma_bw, disp_xgmi_bw, disp_lat_us,
+         comb_rdma_bw, comb_xgmi_bw, comb_lat_us].
+        """
+        disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale = (
+            bench_result
+        )
+        repeat = len(disp_dur)
+
+        rounds = []
+        for i in range(repeat):
+            local = torch.tensor(
                 [
-                    "Best",
-                    comb_rdma_bw[1],
-                    comb_bw[1],
-                    comb_ll_bw[1],
-                    comb_lat[0],
+                    disp_rdma[i],
+                    disp_xgmi[i],
+                    disp_dur[i] * 1000,
+                    comb_rdma[i],
+                    comb_xgmi[i],
+                    comb_dur[i] * 1000,
                 ],
-                [
-                    "Worst",
-                    comb_rdma_bw[0],
-                    comb_bw[0],
-                    comb_ll_bw[0],
-                    comb_lat[1],
-                ],
-                [
-                    "Average",
-                    comb_rdma_bw[2],
-                    comb_bw[2],
-                    comb_ll_bw[2],
-                    comb_lat[2],
-                ],
+                dtype=torch.float64,
+            )
+            gathered = [
+                torch.zeros(6, dtype=torch.float64) for _ in range(self.world_size)
             ]
+            dist.all_gather(gathered, local)
+            rounds.append(torch.stack(gathered))
+
+        return torch.stack(rounds), ll_scale  # (repeat, world_size, 6)
+
+    @staticmethod
+    def _compute_stats(data_2d):
+        """(worst, best, avg) from a (rounds, ranks) float tensor.
+
+        avg = mean of per-round rank-means (grand mean, same as PrettyTable).
+        """
+        worst = data_2d.min().item()
+        best = data_2d.max().item()
+        avg = data_2d.mean(dim=1).mean().item()
+        return (worst, best, avg)
+
+    def tuning_dispatch_combine(
+        self, max_num_token, save_tuning_config=None, skip_verify=False
+    ):
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        sm_count = torch.cuda.get_device_properties(
+            self.rank % self.gpu_per_node
+        ).multi_processor_count
+
+        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
+
+        block_set = set()
+        pow2 = 32
+        while pow2 <= sm_count:
+            block_set.add(pow2)
+            pow2 <<= 1
+        block_set.add(sm_count)
+        block_list = sorted(block_set)
+
+        if tuning_scope == "quick":
+            warp_list = [4, 8, 16]
+            _rdma_mode = "quick"
+        else:
+            warp_list = [4, 6, 8, 12, 16]
+            _rdma_mode = "full"
+
+        def rdma_candidates_for(bn):
+            if _rdma_mode == "quick":
+                return sorted(
+                    set(v for v in [max(bn // 2, 1), bn * 2 // 3] if 1 <= v < bn)
+                )
+            return sorted(
+                set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
+            )
+
+        is_ll_kernel = self.config.kernel_type in (
+            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+            mori.ops.EpDispatchCombineKernelType.AsyncLL,
+        )
+        bw_label = "LL BW" if is_ll_kernel else "RDMA BW"
+
+        total_configs = sum(
+            len(warp_list) * len(rdma_candidates_for(bn)) for bn in block_list
         )
         if self.rank == 0:
-            print(disp_table)
-            print(comb_table)
+            print(
+                f"SM count={sm_count}, tuning_scope={tuning_scope}, "
+                f"skip_verify={skip_verify}\n"
+                f"block_num candidates ({len(block_list)}): {block_list}\n"
+                f"warp_per_block candidates: {warp_list}\n"
+                f"BW metric: {bw_label}\n"
+                f"Total configurations: {total_configs}"
+            )
+
+        best_disp_bw = 0
+        best_comb_bw = 0
+        best_disp_config = None
+        best_comb_config = None
+        _zero_stats = {
+            "rdma": (0, 0, 0),
+            "xgmi": (0, 0, 0),
+            "ll": (0, 0, 0),
+            "lat": (0, 0, 0),
+        }
+        best_disp_stats = dict(_zero_stats)
+        best_comb_stats = dict(_zero_stats)
+
+        test_data = self.gen_test_data(
+            max_num_token=max_num_token,
+            use_max_token_num=True,
+            only_my_rank=skip_verify,
+        )
+        if not skip_verify:
+            error_round = set()
+            for wr_i in range(1):
+                self.run_test_once(op, test_data, error_round, wr_i)
+            assert len(error_round) == 0, f"Warmup failed: {error_round}"
+
+        config_idx = 0
+        for bn in block_list:
+            for warp in warp_list:
+                for rdma_bn in rdma_candidates_for(bn):
+                    config_idx += 1
+                    if self.rank == 0:
+                        print(
+                            f"\n{'=' * 60}\n"
+                            f"[{config_idx}/{total_configs}] "
+                            f"block_num={bn}, warp={warp}, rdma_block_num={rdma_bn}\n"
+                            f"{'=' * 60}"
+                        )
+                    bench_result = self.run_bench_once(
+                        max_num_token,
+                        op,
+                        test_data,
+                        repeat=5,
+                        block_num=bn,
+                        rdma_block_num=rdma_bn,
+                        warp_per_block=warp,
+                    )
+                    all_data, ll_scale = self._all_gather_bench_data(bench_result)
+                    kept = all_data[1:]  # skip round 0, same as bench
+                    # kept: (rounds, world_size, 6)
+                    # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
+
+                    # Selection: per-rank avg across kept rounds, min rank
+                    rank_means = kept.mean(dim=0)  # (world_size, 6)
+                    if is_ll_kernel:
+                        disp_bw = (rank_means[:, 1] * ll_scale).min().item()
+                        comb_bw = (rank_means[:, 4] * ll_scale).min().item()
+                    else:
+                        disp_bw = rank_means[:, 0].min().item()
+                        comb_bw = rank_means[:, 3].min().item()
+
+                    # Stats via shared code (same as bench PrettyTable)
+                    disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
+                    comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
+
+                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                        best_disp_bw = disp_bw
+                        best_disp_config = (bn, warp, rdma_bn)
+                        best_disp_stats = disp_stats
+                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
+                        best_comb_bw = comb_bw
+                        best_comb_config = (bn, warp, rdma_bn)
+                        best_comb_stats = comb_stats
+
+                    if self.rank == 0:
+                        da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
+                        print(
+                            f"  disp sel={disp_bw:.1f} xgmi={da:.1f}  "
+                            f"comb sel={comb_bw:.1f} xgmi={ca:.1f}  "
+                            f"(best disp={best_disp_bw:.1f} comb={best_comb_bw:.1f})"
+                        )
+
+        if self.rank == 0:
+            disp_dtype_str = str(self.config.data_type).split(".")[-1]
+            comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+            print(f"\n{'=' * 70}")
+            print("Tuning Result (best config chosen by slowest-rank XGMI BW)")
+            print(f"{'=' * 70}")
+            for label, dtype_s, cfg, st in [
+                ("Dispatch", disp_dtype_str, best_disp_config, best_disp_stats),
+                ("Combine ", comb_dtype_str, best_comb_config, best_comb_stats),
+            ]:
+                self._print_phase_table(
+                    f"{label} ({dtype_s}) block={cfg[0]} warp={cfg[1]} rdma={cfg[2]}",
+                    st,
+                )
+            print(f"{'=' * 70}")
+
+            if save_tuning_config and best_disp_config and best_comb_config:
+                _save_internode_tuning_result(
+                    save_tuning_config,
+                    config=self.config,
+                    max_num_token=max_num_token,
+                    dispatch_hidden_dim=self.dispatch_hidden_dim,
+                    combine_hidden_dim=self.combine_hidden_dim,
+                    combine_data_type=self.combine_data_type,
+                    best_disp_config=best_disp_config,
+                    best_disp_bw=best_disp_bw,
+                    best_disp_all_bw=best_disp_stats,
+                    best_comb_config=best_comb_config,
+                    best_comb_bw=best_comb_bw,
+                    best_comb_all_bw=best_comb_stats,
+                )
 
         del op
-
-        return (disp_bw, disp_rdma_bw, disp_ll_bw, disp_lat), (
-            comb_bw,
-            comb_rdma_bw,
-            comb_ll_bw,
-            comb_lat,
-        )
 
     def profile_dispatch_combine(self, max_num_token):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -909,6 +1514,7 @@ def sweep_bench_dispatch_combine(
     kernel_type,
     num_qp,
     sweep_token_interval,
+    max_total_recv_tokens=0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -917,7 +1523,14 @@ def sweep_bench_dispatch_combine(
     if sweep_token_interval <= 0:
         raise ValueError(f"sweep_token_interval must >= 1, got {sweep_token_interval}")
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, max_tokens, kernel_type, num_qp, dtype
+        global_rank,
+        gpu_per_node,
+        world_size,
+        max_tokens,
+        kernel_type,
+        num_qp,
+        dtype=dtype,
+        max_total_recv_tokens=max_total_recv_tokens,
     )
     test_case.setup()
 
@@ -977,12 +1590,21 @@ def test_dispatch_combine(
     quant_type="none",
     cmd="test",
     sweep_token_interval=64,
+    combine_dtype=None,
+    block_num=-1,
+    rdma_block_num=-1,
+    warp_per_block=-1,
+    max_total_recv_tokens=0,
+    hidden_dim=7168,
+    save_tuning_config=None,
+    skip_verify=False,
+    sentinel_pattern="every_other",
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    if cmd in ("test", "bench", "stress", "profile"):
+    if cmd in ("test", "bench", "stress", "profile", "tuning", "test_sentinel"):
         test_case = EpDispatchCombineTestCase(
             global_rank,
             gpu_per_node,
@@ -992,26 +1614,47 @@ def test_dispatch_combine(
             num_qp,
             quant_type,
             dtype,
+            hidden_dim=hidden_dim,
+            combine_dtype=combine_dtype,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
         test_case.setup()
         if cmd == "test":
             test_case.test_dispatch_combine()
+        elif cmd == "test_sentinel":
+            test_case.test_sentinel_dispatch_combine(
+                sentinel_pattern=sentinel_pattern,
+            )
         elif cmd == "bench":
-            test_case.bench_dispatch_combine(max_tokens)
+            test_case.bench_dispatch_combine(
+                max_tokens,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+                skip_verify=skip_verify,
+            )
         elif cmd == "stress":
             test_case.stress_dispatch_combine()
         elif cmd == "profile":
             test_case.profile_dispatch_combine(max_tokens)
+        elif cmd == "tuning":
+            test_case.tuning_dispatch_combine(
+                max_tokens,
+                save_tuning_config=save_tuning_config,
+                skip_verify=skip_verify,
+            )
         test_case.cleanup()
     elif cmd == "sweep_bench":
         sweep_bench_dispatch_combine(
             local_rank,
             num_node,
             gpu_per_node,
+            dtype,
             max_tokens,
             kernel_type,
             num_qp,
             sweep_token_interval,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
     else:
         raise ValueError(f"unsupported command: {cmd}")
@@ -1021,8 +1664,9 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
-    "fp4": torch.float4_e2m1fn_x2,
 }
+if hasattr(torch, "float4_e2m1fn_x2"):
+    _DATA_TYPE_MAP["fp4"] = torch.float4_e2m1fn_x2
 
 
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
@@ -1030,15 +1674,30 @@ parser.add_argument(
     "--cmd",
     type=str,
     default="test",
-    choices=["test", "bench", "stress", "sweep_bench", "profile"],
-    help="Available subcommands: test, bench, stress, sweep_bench",
+    choices=[
+        "test",
+        "test_sentinel",
+        "bench",
+        "stress",
+        "sweep_bench",
+        "profile",
+        "tuning",
+    ],
+    help="Available subcommands: test, test_sentinel, bench, stress, sweep_bench, profile, tuning",
 )
 parser.add_argument(
     "--dtype",
     type=str,
     default="bf16",
-    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
+    choices=list(_DATA_TYPE_MAP.keys()),
     help="Data type of dispatch / combine",
+)
+parser.add_argument(
+    "--combine-dtype",
+    type=str,
+    default=None,
+    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+    help="Data type for combine phase. Defaults to same as --dtype.",
 )
 parser.add_argument(
     "--max-tokens",
@@ -1062,7 +1721,7 @@ parser.add_argument(
 parser.add_argument(
     "--num-qp",
     type=int,
-    default=1,
+    default=2,
     help="Number of qp per processing endpoint",
 )
 parser.add_argument(
@@ -1075,6 +1734,60 @@ parser.add_argument(
         "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
     ),
 )
+parser.add_argument(
+    "--block-num",
+    type=int,
+    default=None,
+    help="Override block_num for bench mode.",
+)
+parser.add_argument(
+    "--warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for bench mode.",
+)
+parser.add_argument(
+    "--rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for bench mode.",
+)
+parser.add_argument(
+    "--max-recv-total-tokens",
+    type=int,
+    default=0,
+    help="Maximum total number of received tokens across all ranks (default: 0, meaning no limit)",
+)
+parser.add_argument(
+    "--hidden-dim",
+    type=int,
+    default=7168,
+    help="Base hidden dimension for the model (default: 7168)",
+)
+parser.add_argument(
+    "--save-tuning-config",
+    type=str,
+    default=None,
+    help=(
+        "Path to save tuning results as JSON config. "
+        "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
+    ),
+)
+parser.add_argument(
+    "--skip-verify",
+    action="store_true",
+    default=False,
+    help="Skip correctness verification in bench mode to reduce GPU memory usage.",
+)
+parser.add_argument(
+    "--sentinel-pattern",
+    type=str,
+    default="every_other",
+    help=(
+        "-1 routing sentinel injection for test_sentinel: every_other, "
+        "first_only, or an integer suffix count (e.g. 1)."
+    ),
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1082,19 +1795,38 @@ if __name__ == "__main__":
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
     num_node = int(os.environ["WORLD_SIZE"])
 
+    combine_dtype_str = (
+        args_cli.combine_dtype if args_cli.combine_dtype else args_cli.dtype
+    )
+    dispatch_dtype = _DATA_TYPE_MAP[args_cli.dtype]
+    combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
+
+    sentinel_pattern = args_cli.sentinel_pattern
+    if sentinel_pattern.isdigit():
+        sentinel_pattern = int(sentinel_pattern)
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(
             num_node,
             gpu_per_node,
-            _DATA_TYPE_MAP[args_cli.dtype],
+            dispatch_dtype,
             args_cli.max_tokens,
             args_cli.kernel_type,
             args_cli.num_qp,
             args_cli.quant_type,
             args_cli.cmd,
             args_cli.sweep_token_interval,
+            combine_dtype,
+            args_cli.block_num if args_cli.block_num is not None else -1,
+            args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
+            args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
+            args_cli.max_recv_total_tokens,
+            args_cli.hidden_dim,
+            args_cli.save_tuning_config,
+            args_cli.skip_verify,
+            args_cli.sentinel_pattern,
         ),
         nprocs=gpu_per_node,
         join=True,

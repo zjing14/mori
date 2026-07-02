@@ -21,17 +21,228 @@
 // SOFTWARE.
 #include "src/io/rdma/backend_impl.hpp"
 
+#include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/compCh (forward-declared in core)
 #include <sys/epoll.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
+#include <string>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/protocol.hpp"
 namespace mori {
 namespace io {
+
+static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
+  if (config.enableNotification && config.notifPerQp == 0) {
+    MORI_IO_ERROR(
+        "Invalid RDMA config: notifPerQp must be >= 1 when notification is enabled; got {}",
+        config.notifPerQp);
+    throw std::runtime_error(
+        "Invalid RDMA config: notifPerQp must be >= 1 when notification is "
+        "enabled");
+  }
+}
+
+void ValidateRdmaTransferConfig(const RdmaBackendConfig& config) {
+  if (config.maxChunksPerTransfer < 1) {
+    MORI_IO_ERROR("Invalid RDMA config: maxChunksPerTransfer must be >= 1; got {}",
+                  config.maxChunksPerTransfer);
+    throw std::runtime_error("Invalid RDMA config: maxChunksPerTransfer must be >= 1");
+  }
+  if (config.numNicsPerTransfer < 1) {
+    MORI_IO_ERROR("Invalid RDMA config: numNicsPerTransfer must be >= 1; got {}",
+                  config.numNicsPerTransfer);
+    throw std::runtime_error("Invalid RDMA config: numNicsPerTransfer must be >= 1");
+  }
+  if (config.enableTransferChunking && config.chunkBytes < 4096) {
+    MORI_IO_ERROR(
+        "Invalid RDMA config: chunkBytes must be >= 4096 when chunking is enabled; got {}",
+        config.chunkBytes);
+    throw std::runtime_error(
+        "Invalid RDMA config: chunkBytes must be >= 4096 when chunking is enabled");
+  }
+}
+
+bool UsesInlineOnly(const RdmaBackendConfig& config) { return config.numNicsPerTransfer > 1; }
+
+static const char* MemoryLocationTypeName(MemoryLocationType loc) {
+  switch (loc) {
+    case MemoryLocationType::CPU:
+      return "CPU";
+    case MemoryLocationType::GPU:
+      return "GPU";
+    case MemoryLocationType::Unknown:
+    default:
+      return "Unknown";
+  }
+}
+
+// Parse MORI_IO_POLL_CQ_MODE: "0"/"polling" or "1"/"event" (case-insensitive).
+// Returns nullopt for anything else so env::Override warns and keeps the
+// config value (no silent fallback).
+std::optional<PollCqMode> ParsePollCqMode(const char* raw) {
+  if (std::strcmp(raw, "0") == 0 || mori::env::detail::EqualsIgnoreCase(raw, "polling")) {
+    return PollCqMode::POLLING;
+  }
+  if (std::strcmp(raw, "1") == 0 || mori::env::detail::EqualsIgnoreCase(raw, "event")) {
+    return PollCqMode::EVENT;
+  }
+  return std::nullopt;
+}
+
+// Parse MORI_IO_POST_BATCH_SIZE: only -1 (auto) or a positive int are valid.
+// Rejects 0 / negatives (which the post path would silently clamp to 1) so
+// env::Override warns and keeps the config value.
+std::optional<int> ParsePostBatchSize(const char* raw) {
+  if (std::strcmp(raw, "-1") == 0) return -1;
+  return mori::env::detail::ParsePositiveInt(raw);
+}
+
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote) {
+  if (local.loc == MemoryLocationType::GPU || remote.loc == MemoryLocationType::GPU) {
+    return 1;
+  }
+  return std::max(1, config.numNicsPerTransfer);
+}
+
+enum class CqeFailureOrigin : uint8_t {
+  BatchTransfer = 0,
+  NotificationSend,
+  NotificationRecv,
+  Unknown,
+};
+
+struct CqeFailureAdvice {
+  const char* statusText{nullptr};
+  std::string hint;
+
+  bool HasHint() const { return !hint.empty(); }
+
+  std::string ComposeStatusMessage() const {
+    std::string message = statusText != nullptr ? statusText : "unknown";
+    if (hint.empty()) return message;
+    message += " Hint: ";
+    message += hint;
+    return message;
+  }
+};
+
+class TcpEndpointGuard {
+ public:
+  TcpEndpointGuard(application::TCPContext* ctx, application::TCPEndpointHandle ep)
+      : ctx_(ctx), ep_(ep), armed_(true) {}
+  ~TcpEndpointGuard() {
+    if (armed_ && ctx_ != nullptr) ctx_->CloseEndpointNoThrow(ep_);
+  }
+
+  TcpEndpointGuard(const TcpEndpointGuard&) = delete;
+  TcpEndpointGuard& operator=(const TcpEndpointGuard&) = delete;
+
+ private:
+  application::TCPContext* ctx_{nullptr};
+  application::TCPEndpointHandle ep_{};
+  bool armed_{false};
+};
+
+class PendingEndpointGuard {
+ public:
+  PendingEndpointGuard(RdmaManager* rdma, int devId, application::RdmaEndpoint ep)
+      : rdma_(rdma), devId_(devId), ep_(ep), armed_(true) {}
+  ~PendingEndpointGuard() {
+    if (armed_ && rdma_ != nullptr) rdma_->DestroyEndpointNoThrow(devId_, ep_);
+  }
+
+  PendingEndpointGuard(const PendingEndpointGuard&) = delete;
+  PendingEndpointGuard& operator=(const PendingEndpointGuard&) = delete;
+
+  void Commit() noexcept { armed_ = false; }
+
+ private:
+  RdmaManager* rdma_{nullptr};
+  int devId_{-1};
+  application::RdmaEndpoint ep_{};
+  bool armed_{false};
+};
+
+static void LogAsyncTransferFailureIfNeeded(internal::IoCallDiagnostics* diagnostics, uint32_t code,
+                                            const std::string& message) {
+  if (diagnostics == nullptr || diagnostics->Label() == nullptr) return;
+
+  internal::IoFailureKind failureKind = diagnostics->CurrentFailureKind();
+  if (failureKind != internal::IoFailureKind::FlushCascade ||
+      !diagnostics->TryMarkLogged(failureKind)) {
+    return;
+  }
+
+  MORI_IO_DEBUG("{} error {} message {}", diagnostics->Label(), code, message);
+}
+
+static CqeFailureOrigin ClassifyCqeFailureOrigin(uint64_t wrId, uint32_t notifPerQp) {
+  if (IsNotifSendWrId(wrId)) return CqeFailureOrigin::NotificationSend;
+  if (wrId < notifPerQp) return CqeFailureOrigin::NotificationRecv;
+  return CqeFailureOrigin::BatchTransfer;
+}
+
+static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigin origin,
+                                           const RdmaBackendConfig& config) {
+  CqeFailureAdvice advice{ibv_wc_status_str(status), {}};
+  switch (status) {
+    case IBV_WC_RETRY_EXC_ERR:
+      advice.hint =
+          "transport retry limit exceeded; check peer liveness/connectivity, verify GID "
+          "selection (unset or correct MORI_IB_GID_INDEX), and if running RoCE verify QoS "
+          "settings such as MORI_IO_SL/MORI_IO_TC or MORI_RDMA_SL/MORI_RDMA_TC.";
+      break;
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+      if (origin == CqeFailureOrigin::NotificationSend) {
+        advice.hint =
+            "receiver not ready for SEND completions; if notifications are enabled, ensure the "
+            "peer pre-posts enough RECV WRs. Try increasing notifPerQp / MORI_IO_QP_MAX_RECV_WR "
+            "(current notifPerQp=" +
+            std::to_string(config.notifPerQp) +
+            "), or set MORI_IO_ENABLE_NOTIFICATION=0 if inbound notification is not required.";
+      } else {
+        advice.hint =
+            "receiver not ready; check the peer receive path. If this is related to MORI "
+            "notifications, increase notifPerQp / MORI_IO_QP_MAX_RECV_WR or disable "
+            "MORI_IO_ENABLE_NOTIFICATION when inbound notification is not required.";
+      }
+      break;
+    case IBV_WC_LOC_PROT_ERR:
+      advice.hint =
+          "local protection error; verify the local buffer is still registered with MORI, lkey "
+          "matches the posted WR, and transfer offsets/lengths stay within the registered range.";
+      break;
+    case IBV_WC_LOC_LEN_ERR:
+      advice.hint =
+          "local length error; verify SGE lengths and transfer offsets stay within the registered "
+          "local MR bounds.";
+      break;
+    case IBV_WC_REM_ACCESS_ERR:
+      advice.hint =
+          "remote access error; verify the remote buffer is still registered, rkey/permissions "
+          "allow this operation, and remote offsets/lengths stay within the registered range.";
+      break;
+    case IBV_WC_REM_OP_ERR:
+      advice.hint =
+          "remote operation error; verify both peers use compatible verbs/QP state and the remote "
+          "endpoint supports the requested RDMA operation.";
+      break;
+    default:
+      break;
+  }
+  return advice;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
@@ -41,7 +252,9 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
     : config(cfg), ctx(ctx) {
   application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
   availDevices = GetActiveDevicePortList(devices);
-  assert(availDevices.size() > 0);
+  if (availDevices.empty()) {
+    throw std::runtime_error("RdmaManager: no active RDMA device/port found");
+  }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
   topo.reset(new application::TopoSystem());
@@ -61,22 +274,70 @@ RdmaManager::~RdmaManager() {
   }
 }
 
-std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
+std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key, int requestedNics) {
+  if (requestedNics <= 0) {
+    requestedNics = std::max(1, config.numNicsPerTransfer);
+  }
+
   if (key.loc == MemoryLocationType::GPU) {
-    std::string nicName = topo->MatchGpuAndNic(key.deviceId);
-    assert(!nicName.empty());
-    for (int i = 0; i < availDevices.size(); i++) {
-      if (availDevices[i].first->Name() == nicName) {
-        return {{i, 1}};
+    std::vector<std::string> nicNames;
+    if (requestedNics == 1) {
+      std::string nicName = topo->MatchGpuAndNic(key.deviceId);
+      if (!nicName.empty()) nicNames.push_back(std::move(nicName));
+    } else {
+      nicNames = topo->MatchGpuAndNics(key.deviceId, requestedNics);
+    }
+
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(nicNames.size());
+    for (const auto& nicName : nicNames) {
+      for (int i = 0; i < availDevices.size(); i++) {
+        if (availDevices[i].first->Name() == nicName) {
+          matches.push_back({i, 1});
+          break;
+        }
       }
     }
+    if (!matches.empty()) return matches;
+    MORI_IO_WARN("No matching NIC found for GPU {}", key.deviceId);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
-    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
-    return {{idx, 1}};
+    const char* envNic = std::getenv("MORI_IO_RDMA_NIC_IDX");
+    if (envNic) {
+      if (requestedNics > 1) {
+        MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX pins a single NIC; multi-NIC selection is disabled");
+      }
+      int idx = std::atoi(envNic);
+      if (idx >= 0 && idx < static_cast<int>(availDevices.size())) {
+        return {{idx, 1}};
+      }
+      MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX={} out of range [0, {}), falling back to round-robin", idx,
+                   availDevices.size());
+    }
+
+    if (requestedNics == 1) {
+      int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
+      return {{idx, 1}};
+    }
+
+    std::vector<std::string> nicNames = topo->MatchCpuNics(key.numaNode, requestedNics);
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(nicNames.size());
+    for (const auto& nicName : nicNames) {
+      for (int i = 0; i < availDevices.size(); i++) {
+        if (availDevices[i].first->Name() == nicName) {
+          matches.push_back({i, 1});
+          break;
+        }
+      }
+    }
+    if (!matches.empty()) return matches;
+    MORI_IO_WARN("No matching NIC found for CPU numa node {}", key.numaNode);
   }
-  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
-  return {};
+  MORI_IO_ERROR(
+      "topo searching for device other than CPU/GPU is not implemented yet, returning default "
+      "device 0");
+  return {{0, 1}};
 }
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
@@ -85,7 +346,7 @@ std::optional<application::RdmaMemoryRegion> RdmaManager::GetLocalMemory(int dev
   std::shared_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, id};
   if (mTable.find(key) == mTable.end()) return std::nullopt;
-  return mTable[key];
+  return mTable.at(key);
 }
 
 application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const MemoryDesc& desc) {
@@ -105,17 +366,37 @@ void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
   }
 }
 
+void RdmaManager::DeregisterLocalMemory(const MemoryDesc& desc) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  std::vector<MemoryKey> keysToErase;
+  keysToErase.reserve(mTable.size());
+  for (const auto& [key, _] : mTable) {
+    if (key.id == desc.id) keysToErase.push_back(key);
+  }
+  for (const auto& key : keysToErase) {
+    auto it = mTable.find(key);
+    if (it == mTable.end()) continue;
+    if (key.devId >= 0 && key.devId < static_cast<int>(deviceCtxs.size()) &&
+        deviceCtxs[key.devId] != nullptr) {
+      deviceCtxs[key.devId]->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data));
+    }
+    mTable.erase(it);
+  }
+}
+
 /* ---------------------------------- Remote Memory Management ---------------------------------- */
 std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(EngineKey ekey,
                                                                           int remRdmaDevId,
                                                                           MemoryUniqueId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
+  auto remoteIt = remotes.find(ekey);
+  if (remoteIt == remotes.end()) return std::nullopt;
   MemoryKey key{remRdmaDevId, id};
-  RemoteEngineMeta& remote = remotes[ekey];
+  const RemoteEngineMeta& remote = remoteIt->second;
   if (remote.mTable.find(key) == remote.mTable.end()) {
     return std::nullopt;
   }
-  return remote.mTable[key];
+  return remote.mTable.at(key);
 }
 
 void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id,
@@ -138,12 +419,20 @@ void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, Memor
 /* ------------------------------------- Endpoint Management ------------------------------------ */
 int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key].size();
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return 0;
+  auto tableIt = remoteIt->second.rTable.find(key);
+  if (tableIt == remoteIt->second.rTable.end()) return 0;
+  return tableIt->second.size();
 }
 
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key];
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return {};
+  auto tableIt = remoteIt->second.rTable.find(key);
+  if (tableIt == remoteIt->second.rTable.end()) return {};
+  return tableIt->second;
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
@@ -162,39 +451,45 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   epConfig.alignment = PAGESIZE;
   epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
 
+  bool is_ionic = (deviceAttr->orig_attr.vendor_id ==
+                   static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
+  if (is_ionic) maxSge = std::min(maxSge, 2u);
 
-  auto getEnvPositiveU32 = [](const char* name) -> std::optional<uint32_t> {
-    const char* v = std::getenv(name);
-    if (v == nullptr || v[0] == '\0') return std::nullopt;
-    char* end = nullptr;
-    unsigned long parsed = std::strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || parsed == 0 || parsed > std::numeric_limits<uint32_t>::max()) {
-      MORI_IO_WARN("Ignore invalid env {}={}", name, v);
-      return std::nullopt;
-    }
-    return static_cast<uint32_t>(parsed);
-  };
+  if (config.enableNotification && maxQpWr < config.notifPerQp) {
+    MORI_IO_ERROR(
+        "Device max_qp_wr={} is less than notifPerQp={}; notification requires at least "
+        "notifPerQp RQ slots. Either reduce notifPerQp or disable notification.",
+        maxQpWr, config.notifPerQp);
+    throw std::runtime_error("Device RQ capacity insufficient for configured notifPerQp");
+  }
 
   uint32_t desiredSendWr = config.maxSendWr > 0 ? static_cast<uint32_t>(config.maxSendWr) : 8192u;
-  uint32_t desiredRecvWr = config.enableNotification ? 1024u : 0u;
+  uint32_t desiredRecvWr = config.enableNotification ? config.notifPerQp : 0u;
   uint32_t desiredCqe = config.maxCqeNum > 0 ? static_cast<uint32_t>(config.maxCqeNum) : 16384u;
   std::optional<uint32_t> desiredMsgSge =
       config.maxMsgSge > 0 ? std::optional<uint32_t>(static_cast<uint32_t>(config.maxMsgSge))
                            : std::nullopt;
 
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SEND_WR"); v.has_value()) desiredSendWr = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_RECV_WR"); v.has_value()) desiredRecvWr = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_CQE"); v.has_value()) desiredCqe = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_MSG_SGE"); v.has_value()) desiredMsgSge = *v;
+  env::Override("MORI_IO_QP_MAX_SEND_WR", desiredSendWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_RECV_WR", desiredRecvWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_CQE", desiredCqe, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_MSG_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
   // Alias for convenience: keep both MORI_IO_QP_MAX_MSG_SGE and MORI_IO_QP_MAX_SGE.
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SGE"); v.has_value()) desiredMsgSge = *v;
+  env::Override("MORI_IO_QP_MAX_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
+
+  if (config.enableNotification && desiredRecvWr < config.notifPerQp) {
+    MORI_IO_WARN("MORI_IO_QP_MAX_RECV_WR={} is less than notifPerQp={}; clamping to notifPerQp",
+                 desiredRecvWr, config.notifPerQp);
+    desiredRecvWr = config.notifPerQp;
+  }
 
   epConfig.maxMsgsNum = std::min(desiredSendWr, maxQpWr);
-  // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is
-  // enabled. MORI_IO_QP_MAX_RECV_WR can override this baseline when provided.
+  // RQ must fit NotifManager's pre-posted recv WQEs (config.notifPerQp) when notification is
+  // enabled. MORI_IO_QP_MAX_RECV_WR can raise this baseline, but not lower it.
   epConfig.maxRecvWr = desiredRecvWr > 0 ? std::min(desiredRecvWr, maxQpWr) : 0;
   epConfig.maxCqeNum = std::min(desiredCqe, maxCqe);
   uint32_t minRequiredCqe = epConfig.maxMsgsNum + epConfig.maxRecvWr;
@@ -206,14 +501,23 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
     epConfig.maxCqeNum = newCqeNum;
   }
   if (desiredMsgSge.has_value()) {
-    epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
+    if (*desiredMsgSge > maxSge) {
+      MORI_IO_WARN("maxMsgSge={} is greater than max_sge={}; clamping to max_sge", *desiredMsgSge,
+                   maxSge);
+      *desiredMsgSge = maxSge;
+    }
+    epConfig.maxMsgSge = *desiredMsgSge;
   } else {
-#ifdef ENABLE_IONIC
-    epConfig.maxMsgSge = std::min(maxSge, 2u);
-#else
-    epConfig.maxMsgSge = std::min(maxSge, 4u);
-#endif
+    epConfig.maxMsgSge = std::min(maxSge, is_ionic ? 2u : 4u);
   }
+
+  // Inline capacity for the small notification SEND (NotifMessage). Providers such as
+  // bnxt_re reject IBV_SEND_INLINE with ENOMEM unless the QP was created with enough
+  // max_inline_data, so request a small but sufficient amount here.
+  uint32_t desiredInline = config.enableNotification ? 64u : 0u;
+  env::Override("MORI_IO_QP_MAX_INLINE_DATA", desiredInline, mori::env::detail::ParsePositiveU32);
+  epConfig.maxInlineData = desiredInline;
+
   return epConfig;
 }
 
@@ -228,21 +532,56 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   return rdmaEp;
 }
 
-void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::RdmaEndpoint local,
-                                  int rdevId, application::RdmaEndpointHandle remote,
-                                  TopoKeyPair topoKey, int weight) {
+bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept {
+  try {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    if (devId < 0 || devId >= static_cast<int>(deviceCtxs.size()) || deviceCtxs[devId] == nullptr) {
+      MORI_IO_WARN("DestroyEndpointNoThrow: invalid devId={} for qpn={}", devId, ep.handle.qpn);
+      return false;
+    }
+    return deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("DestroyEndpointNoThrow caught exception for devId={} qpn={}: {}", devId,
+                  ep.handle.qpn, e.what());
+  } catch (...) {
+    MORI_IO_ERROR("DestroyEndpointNoThrow caught unknown exception for devId={} qpn={}", devId,
+                  ep.handle.qpn);
+  }
+  return false;
+}
+
+EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
+                                        application::RdmaEndpoint local, int rdevId,
+                                        application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
+                                        int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
+  auto epConfig = GetRdmaEndpointConfig(devId);
+  EpPair ep{weight,
+            devId,
+            rdevId,
+            remoteKey,
+            local,
+            remote,
+            std::make_shared<std::atomic<int>>(0),
+            static_cast<int>(epConfig.maxMsgsNum),
+            std::make_shared<std::atomic<bool>>(false),
+            std::make_shared<SubmissionLedger>(config.notifPerQp),
+            std::make_shared<SqAdmissionEvent>()};
   meta.rTable[topoKey].push_back(ep);
-  epsMap.insert({ep.local.handle.qpn, ep});
+
+  EndpointId id = nextEndpointId_.fetch_add(1);
+  auto rt = std::make_shared<EndpointRuntime>(id, ep);
+  endpointsById_[id] = rt;
+  return id;
 }
 
-std::optional<EpPair> RdmaManager::GetEpPairByQpn(uint32_t qpn) {
+std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  if (epsMap.find(qpn) == epsMap.end()) return std::nullopt;
-  return epsMap[qpn];
+  auto it = endpointsById_.find(id);
+  if (it == endpointsById_.end()) return nullptr;
+  return it->second;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
@@ -250,11 +589,25 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
-void RdmaManager::EnumerateEndpoints(const EnumerateEpCallbackFunc& func) {
-  std::shared_lock<std::shared_mutex> lock(mu);
-  for (auto& it : epsMap) {
-    func(it.first, it.second);
+bool RdmaManager::HasIonicDevice() const {
+  for (const auto& [device, portId] : availDevices) {
+    const ibv_device_attr_ex* attr = device->GetDeviceAttr();
+    if (attr && attr->orig_attr.vendor_id ==
+                    static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando)) {
+      return true;
+    }
   }
+  return false;
+}
+
+std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  std::vector<std::shared_ptr<EndpointRuntime>> result;
+  result.reserve(endpointsById_.size());
+  for (auto& [_, rt] : endpointsById_) {
+    result.push_back(rt);
+  }
+  return result;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId) {
@@ -275,42 +628,43 @@ NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
 
 NotifManager::~NotifManager() { Shutdown(); }
 
-void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
+void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
   if (config.pollCqMode == PollCqMode::EVENT) {
     epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.u32 = qpn;
-    std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-    assert(ep.has_value() && ep->local.ibvHandle.compCh);
-    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
+    ev.data.u64 = rt->id;
+    assert(rt->ep.local.ibvHandle.compCh);
+    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, rt->ep.local.ibvHandle.compCh->fd, &ev));
   }
 
   // Skip notification setup if disabled
   if (!config.enableNotification) {
+    std::lock_guard<std::mutex> lock(mu);
+    registeredRuntimes_[rt->id] = rt;
     return;
   }
 
   std::lock_guard<std::mutex> lock(mu);
-  if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
+  if (notifCtxById_.find(rt->id) != notifCtxById_.end()) return;
 
-  std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-  assert(ep.has_value());
+  registeredRuntimes_[rt->id] = rt;
 
-  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(ep->ldevId);
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(rt->ep.ldevId);
   assert(devCtx);
 
   void* buf;
   SYSCALL_RETURN_ZERO(
-      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, notifPerQp * sizeof(NotifMessage)));
+      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
+                     static_cast<size_t>(config.notifPerQp) * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
 
-  qpNotifCtx.insert({qpn, {mr, buf}});
+  notifCtxById_.insert({rt->id, {mr, buf}});
 
-  struct ibv_qp* qp = ep->local.ibvHandle.qp;
+  struct ibv_qp* qp = rt->ep.local.ibvHandle.qp;
   assert(qp);
 
-  for (uint64_t i = 0; i < notifPerQp; i++) {
+  for (uint64_t i = 0; i < config.notifPerQp; i++) {
     struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(NotifMessage);
     sge.length = sizeof(NotifMessage);
@@ -326,8 +680,19 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
   }
 }
 
-void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
+NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
+    const std::shared_ptr<EndpointRuntime>& rt) {
+  const EpPair& ep = rt->ep;
   ibv_cq* cq = ep.local.ibvHandle.cq;
+  FlushDrainStats flushDrain;
+
+  // Resolve notif context once before the CQ drain loop.
+  QpNotifContext* notifCtxPtr = nullptr;
+  if (config.enableNotification) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto nit = notifCtxById_.find(rt->id);
+    if (nit != notifCtxById_.end()) notifCtxPtr = &nit->second;
+  }
 
   const int batchSize = 32;
   struct ibv_wc wc[batchSize];
@@ -335,6 +700,88 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
+        const CqeFailureOrigin failureOrigin =
+            ClassifyCqeFailureOrigin(wc[i].wr_id, config.notifPerQp);
+        const CqeFailureAdvice failureAdvice =
+            isFlush ? CqeFailureAdvice{ibv_wc_status_str(wc[i].status), {}}
+                    : DescribeCqeFailure(wc[i].status, failureOrigin, config);
+
+        if (isFlush) {
+          flushDrain.Record(wc[i].qp_num);
+          MORI_IO_DEBUG("ProcessOneCqe: flush error #{}: wr_id={} qp_num={}", flushDrain.count,
+                        wc[i].wr_id, wc[i].qp_num);
+        } else {
+          // Non-flush error: this is the root cause — always log at ERROR.
+          if (failureAdvice.HasHint()) {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id={} status={}({}) qp_num={} "
+                "vendor_err={} hint={}",
+                wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
+                wc[i].qp_num, wc[i].vendor_err, failureAdvice.hint);
+          } else {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id={} status={}({}) qp_num={} "
+                "vendor_err={}",
+                wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
+                wc[i].qp_num, wc[i].vendor_err);
+          }
+        }
+
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
+        if (meta) {
+          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          if (isFlush) {
+            meta->diagnostics.MarkFlushCascade();
+          } else {
+            meta->diagnostics.MarkRootCause();
+          }
+          LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
+                                          static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+                                          failureAdvice.ComposeStatusMessage());
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr) {
+            statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
+            meta->status = nullptr;
+          }
+          if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger) {
+            const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
+            ep.degraded->store(false, kSqAdmissionOrder);
+            MORI_IO_WARN(
+                "ProcessOneCqe: recovered degraded EP eid={} qpn={} by releasing {} orphaned WRs",
+                rt->id, ep.local.handle.qpn, orphanedReleased);
+          }
+          NotifySqStateChanged(ep);
+        } else if (IsNotifSendWrId(wc[i].wr_id)) {
+          if (ep.sqDepth) {
+            ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
+            NotifySqStateChanged(ep);
+          }
+          if (!isFlush) {
+            MORI_IO_WARN(
+                "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
+                ExtractTransferIdFromWrId(wc[i].wr_id));
+          }
+        } else if (wc[i].wr_id < config.notifPerQp) {
+          if (!isFlush) {
+            MORI_IO_WARN("ProcessOneCqe: failed notification RECV CQE, wr_id={} (recv_idx)",
+                         wc[i].wr_id);
+          }
+        } else {
+          if (!isFlush) {
+            MORI_IO_WARN(
+                "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
+                "sqDepth may be stale",
+                wc[i].wr_id);
+          }
+        }
+        continue;
+      }
+
       if (wc[i].opcode == IBV_WC_RECV) {
         // Skip RECV processing if notification is disabled
         if (!config.enableNotification) {
@@ -344,14 +791,13 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
         std::lock_guard<std::mutex> lock(mu);
 
-        assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
-        QpNotifContext& ctx = qpNotifCtx[qpn];
+        assert(notifCtxPtr != nullptr);
+        QpNotifContext& ctx = *notifCtxPtr;
 
         // FIXME: this notif mechenism has bug when notif index is wrapped around
         uint64_t idx = wc[i].wr_id;
         NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
         assert(msg.totalNum > 0);
-        // printf("recv notif for transfer %d\n", tid);
 
         EngineKey ekey = ep.remoteEngineKey;
         if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
@@ -374,42 +820,80 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
-        uint64_t id = wc[i].wr_id;
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
-                        wc[i].status, ibv_wc_status_str(wc[i].status));
+        if (!IsNotifSendWrId(wc[i].wr_id)) {
+          MORI_IO_WARN(
+              "ProcessOneCqe: unexpected SEND completion with non-notification wr_id {}; "
+              "releasing 1 sqDepth under current SEND invariant",
+              wc[i].wr_id);
+        }
+        if (ep.sqDepth) {
+          ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
+          NotifySqStateChanged(ep);
         }
       } else {
-        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
-        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-        TransferStatus* statusPtr = msg->meta->status;
-        if (statusPtr != nullptr) {
-          if (wc[i].status == IBV_WC_SUCCESS) {
-            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
-            }
-          } else {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
-                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
-                          ibv_wc_status_str(wc[i].status));
-            // set status to nullptr indicate that transfer failed
-            msg->meta->status = nullptr;
+        // Batch path: wr_id carries a recordId from the SubmissionLedger.
+        uint64_t recordId = wc[i].wr_id;
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
+        if (meta) {
+          NotifySqStateChanged(ep);
+          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
+            statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
           }
+          MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
+                        meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
+        } else {
+          MORI_IO_WARN(
+              "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); sqDepth may be stale",
+              wc[i].wr_id, recordId);
         }
-        MORI_IO_TRACE(
-            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
-            "cur "
-            "batch size {}",
-            msg->meta->id,
-            statusPtr != nullptr ? statusPtr->CodeUint32()
-                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-          delete msg->meta;
-        }
-        delete msg;
       }
+    }
+  }
+
+  if (!flushDrain.Empty()) {
+    MORI_IO_DEBUG("ProcessOneCqe: drain — {} flush errors on eid={} qp_num={}", flushDrain.count,
+                  rt->id, flushDrain.firstQpNum);
+  }
+  return flushDrain;
+}
+
+void NotifManager::EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats) {
+  if (roundStats.Empty()) {
+    flushSummaryStreak_ = 0;
+    return;
+  }
+
+  flushSummaryStreak_++;
+  const bool shouldLog =
+      (flushSummaryStreak_ == 1) ||
+      (flushSummaryStreak_ < 64 && (flushSummaryStreak_ & (flushSummaryStreak_ - 1)) == 0) ||
+      (flushSummaryStreak_ % 1000 == 0);
+
+  if (shouldLog) {
+    if (flushSummaryStreak_ == 1) {
+      MORI_IO_ERROR(
+          "CQ poll round summary: {} flush errors across {} endpoint(s); "
+          "representative eid={} qp_num={}. "
+          "Flush errors are cascaded from QP(s) entering Error State. "
+          "Check: (1) peer process alive, (2) PFC / network congestion, "
+          "(3) ibv_devinfo / dmesg for HW errors",
+          roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
+          roundStats.sampleQpNum);
+    } else {
+      MORI_IO_WARN(
+          "CQ poll round summary: {} flush errors across {} endpoint(s); "
+          "representative eid={} qp_num={}; in "
+          "consecutive flush round #{} (rate-limited). "
+          "Flush errors are cascaded from QP(s) entering Error State. "
+          "Check: (1) peer process alive, (2) PFC / network congestion, "
+          "(3) ibv_devinfo / dmesg for HW errors",
+          roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
+          roundStats.sampleQpNum, flushSummaryStreak_);
     }
   }
 }
@@ -419,14 +903,21 @@ void NotifManager::MainLoop() {
     constexpr int maxEvents = 128;
     epoll_event events[maxEvents];
     while (running.load()) {
+      FlushRoundStats roundStats;
+      bool handledCqEvent = false;
       int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
       for (int i = 0; i < nfds; ++i) {
-        uint32_t qpn = events[i].data.u32;
+        EndpointId eid = events[i].data.u64;
 
-        std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-        if (!ep.has_value()) continue;
+        std::shared_ptr<EndpointRuntime> rt;
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          auto it = registeredRuntimes_.find(eid);
+          if (it == registeredRuntimes_.end()) continue;
+          rt = it->second;
+        }
 
-        struct ibv_comp_channel* ch = ep->local.ibvHandle.compCh;
+        struct ibv_comp_channel* ch = rt->ep.local.ibvHandle.compCh;
 
         struct ibv_cq* cq = nullptr;
         void* evCtx = nullptr;
@@ -434,12 +925,26 @@ void NotifManager::MainLoop() {
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
-        ProcessOneCqe(qpn, ep.value());
+        handledCqEvent = true;
+        roundStats.Merge(rt->id, ProcessOneCqe(rt));
+      }
+      if (handledCqEvent) {
+        EmitFlushSummaryIfNeeded(roundStats);
       }
     }
   } else {
     while (running.load()) {
-      rdma->EnumerateEndpoints([this](int qpn, const EpPair& ep) { this->ProcessOneCqe(qpn, ep); });
+      auto snapshot = rdma->SnapshotEndpointRuntimes();
+      if (snapshot.empty()) {
+        EmitFlushSummaryIfNeeded(FlushRoundStats{});
+        std::this_thread::yield();
+        continue;
+      }
+      FlushRoundStats roundStats;
+      for (auto& rt : snapshot) {
+        roundStats.Merge(rt->id, ProcessOneCqe(rt));
+      }
+      EmitFlushSummaryIfNeeded(roundStats);
     }
   }
 }
@@ -480,8 +985,9 @@ void NotifManager::Shutdown() {
 /* ----------------------------------------------------------------------------------------------
  */
 ControlPlaneServer::ControlPlaneServer(const std::string& k, const std::string& host, int port,
-                                       RdmaManager* rdmaMgr, NotifManager* notifMgr)
-    : myEngKey(k) {
+                                       const RdmaBackendConfig& cfg, RdmaManager* rdmaMgr,
+                                       NotifManager* notifMgr)
+    : myEngKey(k), config(cfg) {
   ctx.reset(new application::TCPContext(host, port));
   rdma = rdmaMgr;
   notif = notifMgr;
@@ -499,32 +1005,49 @@ void ControlPlaneServer::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   engines.erase(rdesc.key);
 }
 
-void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
+std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& ekey) const {
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = engines.find(ekey);
+  if (it == engines.end()) return std::nullopt;
+  return it->second.port;
+}
+
+void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    auto engineIt = engines.find(ekey);
+    if (engineIt == engines.end()) {
+      throw std::runtime_error("BuildRdmaConn: remote engine " + ekey + " is not registered");
+    }
+    EngineDesc& rdesc = engineIt->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
+  TcpEndpointGuard tcpGuard(ctx.get(), tcph);
 
-  auto candidates = rdma->Search(topo.local);
-  assert(!candidates.empty());
-  auto [devId, weight] = candidates[0];
+  int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
+  auto candidates = rdma->Search(topo.local, requestedNics);
+  if (candidates.empty()) {
+    throw std::runtime_error("BuildRdmaConn: no matching local RDMA NIC candidate");
+  }
+  int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
+  auto [devId, weight] = candidates[rank];
 
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
+  PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
 
   Protocol p(tcph);
-  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle});
+  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
   MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEndpoint);
+  ExpectMessage(hdr, MessageType::RegEndpoint, "BuildRdmaConn reply from " + ekey);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
-  rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
-  notif->RegisterEndpointByQpn(lep.handle.qpn);
+  EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
+  pendingEndpoint.Commit();
+  auto ert = rdma->GetEndpointRuntime(eid);
+  notif->RegisterEndpoint(ert);
   MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
-  ctx->CloseEndpoint(tcph);
 }
 
 void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
@@ -542,15 +1065,20 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    auto engineIt = engines.find(ekey);
+    if (engineIt == engines.end()) {
+      throw std::runtime_error("AskRemoteMemoryRegion: remote engine " + ekey +
+                               " is not registered");
+    }
+    EngineDesc& rdesc = engineIt->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
+  TcpEndpointGuard tcpGuard(ctx.get(), tcph);
 
   Protocol p(tcph);
   p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
   MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::AskMemoryRegion);
+  ExpectMessage(hdr, MessageType::AskMemoryRegion, "AskRemoteMemoryRegion reply from " + ekey);
   MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
 
   return msg.mr;
@@ -562,14 +1090,22 @@ void ControlPlaneServer::AcceptRemoteEngineConn() {
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = ep.fd;
-    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep.fd, &ev));
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, ep.fd, &ev) != 0) {
+      MORI_IO_ERROR("ControlPlaneServer: epoll_ctl ADD failed for fd {}: errno={} ({})", ep.fd,
+                    errno, strerror(errno));
+      ctx->CloseEndpointNoThrow(ep);
+      continue;
+    }
     eps.insert({ep.fd, ep});
   }
 }
 
 void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
-  assert(eps.find(fd) != eps.end());
-  application::TCPEndpointHandle tcph = eps[fd];
+  auto epIt = eps.find(fd);
+  if (epIt == eps.end()) {
+    throw ProtocolError("ControlPlaneServer: no TCP endpoint for fd " + std::to_string(fd));
+  }
+  application::TCPEndpointHandle tcph = epIt->second;
 
   Protocol p(tcph);
   MessageHeader hdr = p.ReadMessageHeader();
@@ -577,15 +1113,43 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-      auto candidates = rdma->Search(msg.topo.remote);
-      assert(!candidates.empty());
       int rdevId = msg.devId;
-      auto [devId, weight] = candidates[0];
+
+      // Rail affinity: if the sender provided a valid railId, use the same
+      // availDevices index so that both endpoints sit on the same network rail
+      // (leaf switch pair), reducing cross-spine hops.
+      int devId = -1;
+      int weight = 1;
+      bool railAffinityEnabled = false;
+      const char* envRailAffinity = std::getenv("MORI_IO_RAIL_AFFINITY");
+      if (envRailAffinity != nullptr && std::string(envRailAffinity) == "1") {
+        railAffinityEnabled = true;
+      }
+
+      if (railAffinityEnabled && msg.railId >= 0 &&
+          msg.railId < static_cast<int>(rdma->NumAvailDevices())) {
+        devId = msg.railId;
+        MORI_IO_TRACE("Rail affinity: using railId={} from sender", msg.railId);
+      } else {
+        // Fallback: original behavior (topo search + nicRank)
+        int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
+        auto candidates = rdma->Search(msg.topo.remote, requestedNics);
+        if (candidates.empty()) {
+          throw ProtocolError("RegEndpoint: no matching local RDMA NIC candidate");
+        }
+        int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
+        std::tie(devId, weight) = candidates[rank];
+      }
+
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
-      notif->RegisterEndpointByQpn(lep.handle.qpn);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
-      SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
+      PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
+      EndpointId eid =
+          rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+      pendingEndpoint.Commit();
+      auto ert = rdma->GetEndpointRuntime(eid);
+      notif->RegisterEndpoint(ert);
+      p.WriteMessageRegEndpoint(
+          MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
       break;
     }
     case MessageType::AskMemoryRegion: {
@@ -605,11 +1169,24 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       break;
     }
     default:
-      assert(false && "not implemented");
+      throw ProtocolError("unsupported control-plane message type " +
+                          std::to_string(static_cast<int>(hdr.type)));
   }
 
-  ctx->CloseEndpoint(tcph);
+  DropConnection(fd);
+}
+
+void ControlPlaneServer::DropConnection(int fd) noexcept {
+  if (fd < 0) return;
+  if (epfd >= 0 && epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
+    int err = errno;
+    if (err != ENOENT && err != EBADF) {
+      MORI_IO_DEBUG("ControlPlaneServer: epoll_ctl DEL failed for fd {}: errno={} ({})", fd, err,
+                    strerror(err));
+    }
+  }
   eps.erase(fd);
+  if (ctx) ctx->CloseEndpointNoThrow(fd);
 }
 
 void ControlPlaneServer::MainLoop() {
@@ -628,7 +1205,19 @@ void ControlPlaneServer::MainLoop() {
         continue;
       }
 
-      HandleControlPlaneProtocol(fd);
+      try {
+        HandleControlPlaneProtocol(fd);
+      } catch (const std::exception& e) {
+        MORI_IO_ERROR("control-plane handler for fd {} failed: {}; dropping connection", fd,
+                      e.what());
+        DropConnection(fd);
+      } catch (...) {
+        MORI_IO_ERROR(
+            "control-plane handler for fd {} failed with unknown exception; dropping "
+            "connection",
+            fd);
+        DropConnection(fd);
+      }
     }
   }
 }
@@ -665,20 +1254,80 @@ void ControlPlaneServer::Shutdown() {
 /*                                       RdmaBackendSession */
 /* ----------------------------------------------------------------------------------------------
  */
+std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks) {
+  std::vector<int> counts(numRanks, 0);
+  if (totalQp <= 0 || numRanks <= 0) return counts;
+  const int base = totalQp / numRanks;
+  const int rem = totalQp % numRanks;
+  for (int rank = 0; rank < numRanks; ++rank) {
+    counts[rank] = base + (rank < rem ? 1 : 0);
+  }
+  return counts;
+}
+
+EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
+                                           const std::vector<int>& localDevOrder,
+                                           const std::vector<int>& wantPerRank) {
+  assert(localDevOrder.size() == wantPerRank.size());
+  std::unordered_map<int, size_t> rankByDev;
+  for (size_t rank = 0; rank < localDevOrder.size(); ++rank) {
+    rankByDev[localDevOrder[rank]] = rank;
+  }
+
+  std::vector<EpPairVec> buckets(localDevOrder.size());
+  int wantTotal = 0;
+  for (int want : wantPerRank) wantTotal += want;
+
+  for (const auto& ep : eps) {
+    auto it = rankByDev.find(ep.ldevId);
+    if (it == rankByDev.end()) continue;
+    size_t rank = it->second;
+    if (static_cast<int>(buckets[rank].size()) < wantPerRank[rank]) {
+      buckets[rank].push_back(ep);
+    }
+  }
+
+  EpPairVec interleaved;
+  interleaved.reserve(wantTotal);
+  for (size_t round = 0; interleaved.size() < static_cast<size_t>(wantTotal); ++round) {
+    bool progressed = false;
+    for (size_t rank = 0; rank < buckets.size(); ++rank) {
+      if (round >= buckets[rank].size()) continue;
+      interleaved.push_back(buckets[rank][round]);
+      progressed = true;
+      if (interleaved.size() == static_cast<size_t>(wantTotal)) break;
+    }
+    if (!progressed) break;
+  }
+
+  return interleaved;
+}
+
+/* ----------------------------------------------------------------------------------------------
+ */
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
-                                       const application::RdmaMemoryRegion& l,
-                                       const application::RdmaMemoryRegion& r, const EpPairVec& e,
-                                       Executor* exec)
-    : config(config), local(l), remote(r), eps(e), executor(exec) {}
+                                       std::vector<application::RdmaMemoryRegion> localMrPerEp,
+                                       std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
+                                       const EpPairVec& e, Executor* exec,
+                                       MemoryLocationType localLoc)
+    : config(config),
+      localMrPerEp(std::move(localMrPerEp)),
+      remoteMrPerEp(std::move(remoteMrPerEp)),
+      eps(e),
+      executor(exec),
+      localLoc_(localLoc) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
-  RdmaOpRet ret =
-      RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
+  RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
+                                     {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
+                                     config.enableTransferChunking ? config.chunkBytes : 0,
+                                     config.maxChunksPerTransfer, config.enableTransferChunking);
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -697,15 +1346,87 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
+
+  const bool chunk = config.enableTransferChunking;
+  const bool canUseWorkerChunking =
+      executor != nullptr && chunk && localLoc_ == MemoryLocationType::GPU;
+  if (executor != nullptr && chunk && !canUseWorkerChunking) {
+    bool expected = false;
+    if (warnedChunkedWorkerFallback_->compare_exchange_strong(expected, true,
+                                                              std::memory_order_relaxed)) {
+      MORI_IO_WARN(
+          "executor skipped for chunked transfer: worker chunking requires GPU local memory "
+          "(localLoc={}); falling back to inline posting",
+          MemoryLocationTypeName(localLoc_));
+    }
+  }
+
+  int totalCredit = 0;
+  if (canUseWorkerChunking) {
+    const uint64_t maxMessageSize = eps.front().local.maxMsgSize;
+    uint64_t totalWrCount = 0;
+    for (size_t size : sizes) {
+      if (size > std::numeric_limits<uint32_t>::max()) {
+        status->Update(StatusCode::ERR_INVALID_ARGS,
+                       "single request size exceeds UINT32_MAX; split it before submitting");
+        return;
+      }
+      const uint64_t requestWrCount =
+          CountChunksForSize(size, config.chunkBytes, config.maxChunksPerTransfer, maxMessageSize);
+      if (requestWrCount == 0 ||
+          totalWrCount > static_cast<uint64_t>(std::numeric_limits<int>::max()) - requestWrCount) {
+        status->Update(StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range");
+        return;
+      }
+      totalWrCount += requestWrCount;
+    }
+    totalCredit = static_cast<int>(totalWrCount);
+  } else {
+    if (sizes.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      status->Update(StatusCode::ERR_INVALID_ARGS, "batch size exceeds int range");
+      return;
+    }
+    totalCredit = static_cast<int>(sizes.size());
+  }
+
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
-  if (executor) {
-    ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
-                    callbackMeta, id,    config.postBatchSize, isRead};
+  if (canUseWorkerChunking) {
+    ExecutorReq req{eps,
+                    localMrPerEp.front(),
+                    localOffsets,
+                    remoteMrPerEp.front(),
+                    remoteOffsets,
+                    sizes,
+                    callbackMeta,
+                    id,
+                    config.postBatchSize,
+                    isRead,
+                    config.chunkBytes,
+                    config.maxChunksPerTransfer};
+    ret = executor->RdmaBatchReadWrite(req);
+  } else if (executor != nullptr && !chunk) {
+    ExecutorReq req{eps,
+                    localMrPerEp.front(),
+                    localOffsets,
+                    remoteMrPerEp.front(),
+                    remoteOffsets,
+                    sizes,
+                    callbackMeta,
+                    id,
+                    config.postBatchSize,
+                    isRead,
+                    0,
+                    1};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
-    ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
-                             id, isRead, config.postBatchSize);
+    RdmaTransferControl control{};
+    control.chunkBytes = chunk ? config.chunkBytes : 0;
+    control.maxChunks = config.maxChunksPerTransfer;
+    control.creditByWrCount = chunk;
+    ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
+                             callbackMeta, id, isRead, config.postBatchSize, control);
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -727,21 +1448,60 @@ bool RdmaBackendSession::Alive() const { return true; }
 /* ----------------------------------------------------------------------------------------------
  */
 
+bool RdmaBackend::HasActiveDevices() {
+  application::RdmaContext ctx(application::RdmaBackendType::IBVerbs);
+  return !GetActiveDevicePortList(ctx.GetRdmaDeviceList()).empty();
+}
+
 RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
-  application::RdmaContext* ctx =
-      new application::RdmaContext(application::RdmaBackendType::IBVerbs);
-  rdma.reset(new mori::io::RdmaManager(beConfig, ctx));
+  env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
+                mori::env::detail::ParseBool);
+  env::Override("MORI_IO_ENABLE_CHUNKING", config.enableTransferChunking,
+                mori::env::detail::ParseBool);
+  env::Override("MORI_IO_CHUNK_BYTES", config.chunkBytes, mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_MAX_CHUNKS", config.maxChunksPerTransfer,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_NUM_NICS_PER_TRANSFER", config.numNicsPerTransfer,
+                mori::env::detail::ParsePositiveInt);
+  // Perf-sweep / ops overrides for knobs that otherwise only have a config
+  // field.  postBatchSize accepts any int (-1 = auto), the rest are positive.
+  env::Override("MORI_IO_QP_PER_TRANSFER", config.qpPerTransfer,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_POST_BATCH_SIZE", config.postBatchSize, ParsePostBatchSize);
+  env::Override("MORI_IO_NUM_WORKER_THREADS", config.numWorkerThreads,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_POLL_CQ_MODE", config.pollCqMode, ParsePollCqMode);
+  ValidateRdmaNotificationConfig(config);
+  ValidateRdmaTransferConfig(config);
 
-  notif.reset(new NotifManager(rdma.get(), beConfig));
+  auto rdmaCtx = std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs);
+  rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get()));
+  (void)rdmaCtx.release();
+
+  notif.reset(new NotifManager(rdma.get(), config));
   notif->Start();
 
-  server.reset(
-      new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, rdma.get(), notif.get()));
+  server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
+                                      notif.get()));
   server->Start();
 
-  if (config.numWorkerThreads > 1) {
+  if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
+    MORI_IO_WARN(
+        "ionic NIC detected with qpPerTransfer=1: single-QP ionic performance is prone to SQ "
+        "full under load; consider increasing qpPerTransfer (e.g. 4) and setting "
+        "numWorkerThreads to the same value");
+  }
+
+  bool useInlineOnly = UsesInlineOnly(config);
+  if (config.numWorkerThreads > 1 && useInlineOnly) {
+    MORI_IO_WARN(
+        "numWorkerThreads={} is ignored because multi-NIC transfer is enabled; using "
+        "single-thread inline posting",
+        config.numWorkerThreads);
+  }
+  if (config.numWorkerThreads > 1 && !useInlineOnly) {
     executor.reset(
         new MultithreadExecutor(std::min(config.qpPerTransfer, config.numWorkerThreads)));
     executor->Start();
@@ -772,7 +1532,14 @@ void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
+  rdma->DeregisterLocalMemory(desc);
   InvalidateSessionsForMemory(desc.id);
+}
+
+bool RdmaBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
+  (void)local;
+  auto rport = server->TryGetRemoteEnginePort(remote.engineKey);
+  return rport.has_value() && rport.value() != internal::kXgmiOnlyFallbackPlaceholderPort;
 }
 
 void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
@@ -808,39 +1575,114 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
 
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
                                 RdmaBackendSession& sess) {
-  TopoKey localKey{local.deviceId, local.loc};
-  TopoKey remoteKey{remote.deviceId, remote.loc};
+  TopoKey localKey{local.deviceId, local.loc, local.numaNode};
+  TopoKey remoteKey{remote.deviceId, remote.loc, remote.numaNode};
   TopoKeyPair kp{localKey, remoteKey};
 
   EngineKey ekey = remote.engineKey;
 
-  // Create a pair of endpoint if none
-  int epNum = rdma->CountEndpoint(ekey, kp);
-  for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
-    server->BuildRdmaConn(ekey, kp);
+  auto buildLock = GetConnBuildLock(ekey, kp);
+  std::lock_guard<std::mutex> connGuard(*buildLock);
+
+  std::vector<std::pair<int, int>> localCandidates;
+  int effectiveNumNics = 1;
+  int requestedNics = ResolveRequestedNics(config, kp.local, kp.remote);
+  if (requestedNics > 1) {
+    localCandidates = rdma->Search(kp.local, requestedNics);
+    if (localCandidates.empty()) {
+      throw std::runtime_error("RdmaBackend::CreateSession: no local RDMA candidate found");
+    }
+    effectiveNumNics = std::max(1, std::min({requestedNics, config.qpPerTransfer,
+                                             static_cast<int>(localCandidates.size())}));
   }
+  std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
+
+  if (effectiveNumNics == 1) {
+    int epNum = rdma->CountEndpoint(ekey, kp);
+    for (int i = epNum; i < config.qpPerTransfer; ++i) {
+      server->BuildRdmaConn(ekey, kp, 0);
+    }
+  } else {
+    std::unordered_map<int, int> rankByDev;
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      rankByDev[localCandidates[rank].first] = rank;
+    }
+
+    EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
+    std::vector<int> haveByRank(effectiveNumNics, 0);
+    for (const auto& ep : existing) {
+      auto it = rankByDev.find(ep.ldevId);
+      if (it != rankByDev.end()) haveByRank[it->second] += 1;
+    }
+
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
+        server->BuildRdmaConn(ekey, kp, rank);
+      }
+    }
+  }
+
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(!eps.empty());
-
-  EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
-
-  // TODO: we assume all eps is on same device and has same ldevId/rdevId
-  EpPair ep = epSet[0];
-  auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
-  if (!localMr.has_value()) {
-    localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+  if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
+    throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
 
-  auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
-  if (!remoteMr.has_value()) {
-    remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
-    // TODO: protocol should return status code
-    // Currently we check member equality to ensure correct memory region
-    assert(remoteMr->length == remote.size);
-    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+  EpPairVec epSet;
+  if (effectiveNumNics == 1) {
+    epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
+  } else {
+    std::vector<int> localDevOrder;
+    localDevOrder.reserve(effectiveNumNics);
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      localDevOrder.push_back(localCandidates[rank].first);
+    }
+    epSet = InterleaveEndpointsByLocalDevice(eps, localDevOrder, desiredPerRank);
+    if (static_cast<int>(epSet.size()) != config.qpPerTransfer) {
+      throw std::runtime_error(
+          "RdmaBackend::CreateSession: failed to assemble multi-NIC endpoint set");
+    }
   }
 
-  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet, executor.get());
+  std::unordered_map<int, application::RdmaMemoryRegion> localMrByDev;
+  std::unordered_map<int, application::RdmaMemoryRegion> remoteMrByDev;
+  std::vector<application::RdmaMemoryRegion> localMrPerEp;
+  std::vector<application::RdmaMemoryRegion> remoteMrPerEp;
+  localMrPerEp.reserve(epSet.size());
+  remoteMrPerEp.reserve(epSet.size());
+
+  for (const auto& ep : epSet) {
+    if (localMrByDev.find(ep.ldevId) == localMrByDev.end()) {
+      auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
+      if (!localMr.has_value()) {
+        localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+      }
+      localMrByDev[ep.ldevId] = *localMr;
+    }
+
+    if (remoteMrByDev.find(ep.rdevId) == remoteMrByDev.end()) {
+      auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
+      if (!remoteMr.has_value()) {
+        application::RdmaMemoryRegion fetchedMr =
+            server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
+        if (fetchedMr.length != remote.size) {
+          std::stringstream ss;
+          ss << "RdmaBackend::CreateSession: remote MR size mismatch for engine " << ekey
+             << " rdevId=" << ep.rdevId << " memId=" << remote.id << " expected=" << remote.size
+             << " got=" << fetchedMr.length;
+          throw std::runtime_error(ss.str());
+        }
+        remoteMr = fetchedMr;
+        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, *remoteMr);
+      }
+      remoteMrByDev[ep.rdevId] = *remoteMr;
+    }
+
+    localMrPerEp.push_back(localMrByDev.at(ep.ldevId));
+    remoteMrPerEp.push_back(remoteMrByDev.at(ep.rdevId));
+  }
+
+  sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
+                            executor.get(), local.loc);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
@@ -879,6 +1721,15 @@ void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
       ++it;
     }
   }
+}
+
+std::shared_ptr<std::mutex> RdmaBackend::GetConnBuildLock(const EngineKey& remoteEngineKey,
+                                                          const TopoKeyPair& topo) {
+  std::lock_guard<std::mutex> guard(connBuildMapMu_);
+  ConnBuildKey key{remoteEngineKey, topo};
+  auto& lockPtr = connBuildMu_[key];
+  if (!lockPtr) lockPtr = std::make_shared<std::mutex>();
+  return lockPtr;
 }
 
 }  // namespace io

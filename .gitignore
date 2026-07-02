@@ -2,6 +2,7 @@
 build/
 build*/
 lib*
+dist/*
 
 # Python
 *.egg-info
@@ -9,7 +10,21 @@ lib*
 *.pyc
 .pytest_cache
 __pycache__
+python/mori/_version.py
+python/mori/_jit-sources/
+python/mori/*.so
+python/mori/umbp_master
+python/mori/spdk_proxy
 
 .vscode
 *.log
 *.core
+.claude/*
+!.claude/skills/
+.codex/
+.cache/
+CMakeFiles/
+python/mori/_jit_sources/
+
+# Bundled tools/*.sh files copied into the package at build time
+python/mori/tools/*.sh

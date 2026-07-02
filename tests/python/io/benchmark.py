@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from tests.python.utils import get_free_port, TorchDistContext
+from tests.python.utils import TorchDistContext
 import torch
 import torch.distributed as dist
 from mori.io import (
@@ -130,9 +130,9 @@ def parse_args():
         help="Whether to enable batch APIs, default: False",
     )
     parser.add_argument(
-        "--batch-non-contiguous",
+        "--batch-contiguous",
         action="store_true",
-        help="Use strided offsets so each transfer is a separate WR (no merging). Use with --max-send-wr to stress SQ / reproduce ENOMEM on notify.",
+        help="Use contiguous offsets so transfers may be merged. Default is non-contiguous (strided offsets, each transfer is a separate WR). Don't enable this when stress SQ / reproduce ENOMEM on notify due to merged wr",
     )
     parser.add_argument(
         "--enable-sess",
@@ -152,16 +152,48 @@ def parse_args():
         help="Number of devices on target side",
     )
     parser.add_argument(
+        "--target-dev-offset",
+        type=int,
+        default=0,
+        help="Shift each target buffer to GPU (role_rank + offset) %% gpu_count, so the "
+        "initiator's GPU i pairs with a different-index target GPU. Used to exercise cross-rail "
+        "transfers on rail-only fabrics (e.g. offset 5 makes GPU0 -> GPU5). GPU memory only.",
+    )
+    parser.add_argument(
         "--num-qp-per-transfer",
         type=int,
-        default=1,
-        help="Number of QPs for a single transfer",
+        default=4,
+        help="Number of QPs for a single transfer (default: 4)",
     )
     parser.add_argument(
         "--num-worker-threads",
         type=int,
         default=1,
         help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--disable-chunking",
+        action="store_true",
+        help="Disable single-transfer chunking (chunking is enabled by default)",
+    )
+    parser.add_argument(
+        "--chunk-bytes",
+        type=int,
+        default=65536,
+        help="Chunk size in bytes when chunking is enabled (default: 64KB)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=64,
+        help="Max number of chunks per transfer (default: 64)",
+    )
+    parser.add_argument(
+        "--mem-type",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Memory type for transfer buffers: 'gpu' (cuda) or 'cpu' (host) (default: gpu)",
     )
     parser.add_argument(
         "--iters",
@@ -218,7 +250,7 @@ class MoriIoBenchmark:
         buffer_size: int,
         transfer_batch_size: int,
         enable_batch_transfer: bool = False,
-        batch_non_contiguous: bool = False,
+        batch_contiguous: bool = False,
         enable_sess: bool = False,
         iters: int = 128,
         sweep: bool = False,
@@ -232,12 +264,17 @@ class MoriIoBenchmark:
         rank_in_node: int = 0,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
-        num_qp_per_transfer: int = 1,
+        target_dev_offset: int = 0,
+        num_qp_per_transfer: int = 4,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
         max_msg_sge: int = 0,
+        enable_chunking: bool = True,
+        chunk_bytes: int = 65536,
+        max_chunks: int = 64,
+        mem_type: str = "gpu",
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -248,7 +285,7 @@ class MoriIoBenchmark:
         self.buffer_size = buffer_size
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
-        self.batch_non_contiguous = batch_non_contiguous
+        self.batch_contiguous = batch_contiguous
         self.enable_sess = enable_sess
         self.iters = iters
         self.sweep = sweep
@@ -263,6 +300,7 @@ class MoriIoBenchmark:
         self.role_rank = rank_in_node
         self.num_initiator_dev = num_initiator_dev
         self.num_target_dev = num_target_dev
+        self.target_dev_offset = target_dev_offset
         self.num_qp_per_transfer = num_qp_per_transfer
         self.num_worker_threads = num_worker_threads
         self.poll_cq_mode = (
@@ -271,6 +309,10 @@ class MoriIoBenchmark:
         self.max_send_wr = max_send_wr
         self.max_cqe_num = max_cqe_num
         self.max_msg_sge = max_msg_sge
+        self.enable_chunking = enable_chunking
+        self.chunk_bytes = chunk_bytes
+        self.max_chunks = max_chunks
+        self.mem_type = mem_type
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -301,16 +343,25 @@ class MoriIoBenchmark:
             self.global_rank = self.role_rank + self.num_initiator_dev
             self.role = EngineRole.TARGET
 
-        self.device = torch.device("cuda", self.role_rank)
-        # When batch_non_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
+        # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
             (self.buffer_size + 1) * self.transfer_batch_size
-            if self.batch_non_contiguous
+            if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
-        self.tensor = torch.randn(total_elements).to(
-            self.device, dtype=torch.float8_e4m3fnuz
-        )
+        if self.mem_type == "cpu":
+            self.device = torch.device("cpu")
+            self.tensor = torch.randint(0, 256, (total_elements,), dtype=torch.uint8)
+        else:
+            gpu_index = self.role_rank
+            if self.role is EngineRole.TARGET and self.target_dev_offset:
+                gpu_index = (
+                    self.role_rank + self.target_dev_offset
+                ) % torch.cuda.device_count()
+            self.device = torch.device("cuda", gpu_index)
+            self.tensor = torch.randn(total_elements).to(
+                self.device, dtype=torch.float8_e4m3fnuz
+            )
 
     def _setup_xgmi(self):
         if self.xgmi_multiprocess:
@@ -324,7 +375,12 @@ class MoriIoBenchmark:
                 self.role = EngineRole.TARGET
                 self.device = torch.device("cuda", self.dst_gpu)
 
-            self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+            total_elements = (
+                (self.buffer_size + 1) * self.transfer_batch_size
+                if not self.batch_contiguous
+                else self.buffer_size * self.transfer_batch_size
+            )
+            self.tensor = torch.randn(total_elements).to(
                 self.device, dtype=torch.float8_e4m3fnuz
             )
         else:
@@ -332,12 +388,17 @@ class MoriIoBenchmark:
             self.src_device = torch.device("cuda", self.src_gpu)
             self.dst_device = torch.device("cuda", self.dst_gpu)
 
-            self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+            total_elements = (
+                (self.buffer_size + 1) * self.transfer_batch_size
+                if not self.batch_contiguous
+                else self.buffer_size * self.transfer_batch_size
+            )
+            self.tensor = torch.randn(total_elements).to(
                 self.src_device, dtype=torch.float8_e4m3fnuz
             )
-            self.target_tensor = torch.zeros(
-                self.buffer_size * self.transfer_batch_size
-            ).to(self.dst_device, dtype=torch.float8_e4m3fnuz)
+            self.target_tensor = torch.zeros(total_elements).to(
+                self.dst_device, dtype=torch.float8_e4m3fnuz
+            )
 
     def print_config(self):
         print("MORI-IO Benchmark Configurations:")
@@ -358,8 +419,14 @@ class MoriIoBenchmark:
             print(f"  role_rank: {self.role_rank}")
             print(f"  num_initiator_dev: {self.num_initiator_dev}")
             print(f"  num_target_dev: {self.num_target_dev}")
+            print(f"  target_dev_offset: {self.target_dev_offset}")
+            print(f"  mem_type: {self.mem_type}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
+            print(f"  enable_chunking: {self.enable_chunking}")
+            if self.enable_chunking:
+                print(f"  chunk_bytes: {self.chunk_bytes}")
+                print(f"  max_chunks: {self.max_chunks}")
             print(f"  poll_cq_mode: {self.poll_cq_mode}")
             if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
                 print(
@@ -369,10 +436,32 @@ class MoriIoBenchmark:
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
-        print(f"  batch_non_contiguous: {self.batch_non_contiguous}")
+        print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
         print()
+
+    def _get_transfer_offsets(self, buffer_size, transfer_batch_size, batched):
+        if batched and not self.batch_contiguous:
+            stride = buffer_size + 1
+            return [i * stride for i in range(transfer_batch_size)]
+        return [i * buffer_size for i in range(transfer_batch_size)]
+
+    def _pack_tensor_segments(self, tensor, buffer_size, transfer_batch_size, batched):
+        offsets = self._get_transfer_offsets(
+            buffer_size, transfer_batch_size, batched=batched
+        )
+        packed = torch.empty(
+            buffer_size * transfer_batch_size,
+            device=tensor.device,
+            dtype=torch.uint8,
+        )
+        for i, offset in enumerate(offsets):
+            end = offset + buffer_size
+            packed[i * buffer_size : (i + 1) * buffer_size].copy_(
+                tensor[offset:end].view(torch.uint8)
+            )
+        return packed
 
     def send_bytes(self, b: bytes, dst: int):
         t = torch.ByteTensor(list(b))
@@ -402,7 +491,7 @@ class MoriIoBenchmark:
                 dtype=torch.uint8,
             )
             dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
-            if self.batch_non_contiguous:
+            if not self.batch_contiguous:
                 # Received data is packed (contiguous); compare to packed view of self.tensor
                 stride = self.buffer_size + 1
                 expected = torch.empty(
@@ -421,9 +510,9 @@ class MoriIoBenchmark:
                 expected = self.tensor.view(torch.uint8)
                 assert torch.equal(recv_tensor, expected)
         else:
-            # With batch_non_contiguous, tensor has (buffer_size+1)*transfer_batch_size
+            # Without batch_contiguous, tensor has (buffer_size+1)*transfer_batch_size
             # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
-            if self.batch_non_contiguous:
+            if not self.batch_contiguous:
                 stride = self.buffer_size + 1
                 packed = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -443,28 +532,41 @@ class MoriIoBenchmark:
 
     def _validate_xgmi(self):
         if self.xgmi_multiprocess:
+            # Target returns from run_once immediately, so sync here before reading
+            # back the transferred segments for validation.
+            dist.barrier()
+            local_packed = self._pack_tensor_segments(
+                self.tensor,
+                self.buffer_size,
+                self.transfer_batch_size,
+                batched=self.enable_batch_transfer,
+            ).cpu()
             if self.role is EngineRole.INITIATOR:
-                transfer_uid = self.engine.allocate_transfer_uid()
-                status = self.engine.write(
-                    self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
+                peer_packed = torch.empty(
+                    self.buffer_size * self.transfer_batch_size,
+                    dtype=torch.uint8,
                 )
-                status.Wait()
-                assert status.Succeeded()
+                dist.recv(peer_packed, src=self.global_rank + 1)
+                assert torch.equal(
+                    local_packed, peer_packed
+                ), "Validation failed: data mismatch"
             else:
-                time.sleep(0.5)
+                dist.send(local_packed, dst=self.global_rank - 1)
         else:
-            transfer_uid = self.engine.allocate_transfer_uid()
-            status = self.engine.write(
-                self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
-            )
-            status.Wait()
-            assert status.Succeeded()
-
-            src_cpu = self.tensor[: self.buffer_size].cpu()
-            dst_cpu = self.target_tensor[: self.buffer_size].cpu()
-            assert torch.equal(
-                src_cpu.view(torch.uint8), dst_cpu.view(torch.uint8)
-            ), "Validation failed: data mismatch"
+            self.run_once(self.buffer_size, self.transfer_batch_size)
+            src_cpu = self._pack_tensor_segments(
+                self.tensor,
+                self.buffer_size,
+                self.transfer_batch_size,
+                batched=self.enable_batch_transfer,
+            ).cpu()
+            dst_cpu = self._pack_tensor_segments(
+                self.target_tensor,
+                self.buffer_size,
+                self.transfer_batch_size,
+                batched=self.enable_batch_transfer,
+            ).cpu()
+            assert torch.equal(src_cpu, dst_cpu), "Validation failed: data mismatch"
 
     def initialize(self):
         if self.backend_type == "xgmi":
@@ -483,6 +585,9 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
+            enable_transfer_chunking=self.enable_chunking,
+            chunk_bytes=self.chunk_bytes,
+            max_chunks_per_transfer=self.max_chunks,
         )
         if self.max_send_wr > 0:
             config.max_send_wr = self.max_send_wr
@@ -633,11 +738,9 @@ class MoriIoBenchmark:
             return 0
 
         # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
-        if self.batch_non_contiguous:
-            stride = buffer_size + 1  # 1-element gap so remote/local are not contiguous
-            offsets = [i * stride for i in range(transfer_batch_size)]
-        else:
-            offsets = [i * buffer_size for i in range(transfer_batch_size)]
+        offsets = self._get_transfer_offsets(
+            buffer_size, transfer_batch_size, batched=True
+        )
         sizes = [buffer_size for _ in range(transfer_batch_size)]
         transfer_uid = self.engine.allocate_transfer_uid()
 
@@ -874,6 +977,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         buffer_size=max_buffer_size,
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
+        batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
@@ -907,7 +1011,7 @@ def benchmark_engine(local_rank, node_rank, args):
         buffer_size=max_buffer_size,
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
-        batch_non_contiguous=args.batch_non_contiguous,
+        batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
@@ -916,17 +1020,22 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_max_size=args.sweep_max_size,
         backend_type="rdma",
         host=args.host,
-        port=get_free_port(),
+        port=0,
         node_rank=node_rank,
         rank_in_node=local_rank,
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
+        target_dev_offset=args.target_dev_offset,
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
         poll_cq_mode=args.poll_cq_mode,
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
         max_msg_sge=args.max_msg_sge,
+        enable_chunking=not args.disable_chunking,
+        chunk_bytes=args.chunk_bytes,
+        max_chunks=args.max_chunks,
+        mem_type=args.mem_type,
     )
     bench.print_config()
     bench.run()
@@ -971,6 +1080,7 @@ def benchmark_xgmi(args):
             buffer_size=max_buffer_size,
             transfer_batch_size=max_transfer_batch_size,
             enable_batch_transfer=args.enable_batch_transfer,
+            batch_contiguous=args.batch_contiguous,
             enable_sess=args.enable_sess,
             iters=args.iters,
             sweep=args.all,

@@ -26,8 +26,8 @@
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
 #include "mori/application/topology/topology.hpp"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;
@@ -57,6 +57,15 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
   CheckBufferKernel<<<blocks, threadsPerBlock>>>(reinterpret_cast<char*>(buffer), numElems,
                                                  expected);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+}
+
+// Largest V <= dbTouchIdx with V % modulus == wrapped % modulus (modulus =
+// sqWqeNum for bnxt/psd, 2^16 for mlx5). Replaces the outstandingWqe[] table.
+__device__ inline uint32_t ReconstructDone(uint32_t wrapped, uint32_t modulus,
+                                           uint32_t dbTouchIdx) {
+  uint32_t v = (dbTouchIdx - (dbTouchIdx % modulus)) + (wrapped % modulus);
+  if (v > dbTouchIdx) v -= modulus;
+  return v;
 }
 
 template <ProviderType P>
@@ -92,21 +101,19 @@ inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
         core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
         assert(false);
       }
-      wqe_id = wq.outstandingWqe[wqe_counter];
+      wqe_id = ReconstructDone(wqe_counter, 1u << 16, dbTouchIdx);
     } else if constexpr (P == core::ProviderType::BNXT) {
       if (opcode != BNXT_RE_REQ_ST_OK) {
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
         assert(false);
       }
-      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
-      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+      wqe_id = ReconstructDone(wqe_counter, wq.sqWqeNum, dbTouchIdx);
     } else if constexpr (P == core::ProviderType::PSD) {
       if (opcode != 0) {
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
         assert(false);
       }
-      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
-      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+      wqe_id = ReconstructDone(wqe_counter, wq.sqWqeNum, dbTouchIdx);
     }
 
     // core::UpdateCqDbrRecord<P>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
@@ -171,7 +178,9 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
       uint32_t wqe_counter;
       PollCq<P>(cqHandle->cqAddr, cqHandle->cqeNum, &my_cq_consumer, &wqe_counter);
       __threadfence_system();
-      wqe_id = endpoint->wqHandle.outstandingWqe[wqe_counter];
+      uint32_t dbTouchIdx = __hip_atomic_load(&endpoint->wqHandle.dbTouchIdx, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+      wqe_id = ReconstructDone(wqe_counter, 1u << 16, dbTouchIdx);
       __hip_atomic_fetch_max(&wqe_broadcast[warp_id], wqe_id, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
@@ -340,17 +349,14 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
   uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
   uint64_t dbr_val;
   if constexpr (P == ProviderType::MLX5) {
-    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else if constexpr (P == ProviderType::BNXT) {
-    wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else if constexpr (P == ProviderType::PSD) {
-    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
@@ -498,17 +504,10 @@ void distRdmaOps(int argc, char* argv[]) {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
-#ifdef ENABLE_IONIC
-  config.gidIdx = 1;
-#else
-  config.gidIdx = 3;
-#endif
+  uint32_t vendor_id = device->GetDeviceAttr()->orig_attr.vendor_id;
+  config.gidIdx = (vendor_id == static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)) ? 1 : 3;
   config.maxMsgsNum = 8092;
-#ifdef ENABLE_BNXT
-  config.maxCqeNum = 1;
-#else
-  config.maxCqeNum = 4096;
-#endif
+  config.maxCqeNum = (vendor_id == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
   config.alignment = 4096;
   config.onGpu = on_gpu;
   std::vector<RdmaEndpoint> endpoints;
@@ -655,18 +654,14 @@ void distRdmaOps(int argc, char* argv[]) {
           MultiQpWrite<ProviderType::MLX5><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#endif
         default:
           break;
       }
@@ -690,20 +685,16 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 global_mr_handles[1], size,
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                 global_mr_handles[1], size,
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                global_mr_handles[1], size,
                                                                warmupIters, blockSync + 1, num_qp);
           break;
-#endif
         default:
           break;
       }
@@ -717,20 +708,16 @@ void distRdmaOps(int argc, char* argv[]) {
               <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT>
               <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                global_mr_handles[1], size, iters,
                                                                blockSync + 1 + warmupIters, num_qp);
           break;
-#endif
         default:
           break;
       }

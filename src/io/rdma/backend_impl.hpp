@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -42,6 +43,24 @@
 
 namespace mori {
 namespace io {
+
+namespace internal {
+
+// Placeholder written into engine_desc.port when an RDMA backend request is
+// rerouted to XGMI-only mode because this host has no active RDMA device.
+inline constexpr uint16_t kXgmiOnlyFallbackPlaceholderPort = 1;
+
+}  // namespace internal
+
+void ValidateRdmaTransferConfig(const RdmaBackendConfig& config);
+bool UsesInlineOnly(const RdmaBackendConfig& config);
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote);
+std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks);
+EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
+                                           const std::vector<int>& localDevOrder,
+                                           const std::vector<int>& wantPerRank);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -53,12 +72,13 @@ class RdmaManager {
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 
   // Topology APIs
-  std::vector<std::pair<int, int>> Search(TopoKey);
+  std::vector<std::pair<int, int>> Search(TopoKey, int requestedNics = -1);
 
   // Local memory management APIs
   std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
   application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
+  void DeregisterLocalMemory(const MemoryDesc& desc);
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
@@ -71,15 +91,16 @@ class RdmaManager {
   int CountEndpoint(EngineKey, TopoKeyPair);
   EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
   application::RdmaEndpoint CreateEndpoint(int devId);
-  void ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local, int rdevId,
-                       application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
-  std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
+  bool DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept;
+  EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
+                             int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
+                             int weight);
+  std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
+  std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
-
-  // Endpoint enumeration
-  using EnumerateEpCallbackFunc = std::function<void(int qpn, const EpPair& ep)>;
-  void EnumerateEndpoints(const EnumerateEpCallbackFunc&);
+  size_t NumAvailDevices() const { return availDevices.size(); }
+  bool HasIonicDevice() const;
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -94,7 +115,8 @@ class RdmaManager {
 
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
-  std::unordered_map<uint32_t, EpPair> epsMap;
+  std::atomic<EndpointId> nextEndpointId_{1};
+  std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -108,8 +130,7 @@ class NotifManager {
   NotifManager(RdmaManager*, const RdmaBackendConfig&);
   ~NotifManager();
 
-  void RegisterEndpointByQpn(uint32_t qpn);
-  // void DeregisterEndpoint(EpPair*);
+  void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
 
   void RegisterDevice(int devId);
 
@@ -120,7 +141,39 @@ class NotifManager {
   void Shutdown();
 
  private:
-  void ProcessOneCqe(int qpn, const EpPair& ep);
+  struct FlushDrainStats {
+    uint64_t count{0};
+    uint32_t firstQpNum{0};
+
+    void Record(uint32_t qpNum) {
+      if (count == 0) firstQpNum = qpNum;
+      count++;
+    }
+
+    bool Empty() const { return count == 0; }
+  };
+
+  struct FlushRoundStats {
+    uint64_t total{0};
+    uint32_t endpointCount{0};
+    EndpointId sampleEndpointId{0};
+    uint32_t sampleQpNum{0};
+
+    void Merge(EndpointId eid, const FlushDrainStats& drain) {
+      if (drain.Empty()) return;
+      if (total == 0) {
+        sampleEndpointId = eid;
+        sampleQpNum = drain.firstQpNum;
+      }
+      total += drain.count;
+      endpointCount++;
+    }
+
+    bool Empty() const { return total == 0; }
+  };
+
+  FlushDrainStats ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt);
+  void EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats);
 
  private:
   RdmaBackendConfig config;
@@ -138,11 +191,15 @@ class NotifManager {
     void* buf;
   };
 
-  uint32_t notifPerQp{1024};
-  std::unordered_map<uint32_t, QpNotifContext> qpNotifCtx;
+  std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
+  std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;
+
+  // Accessed only by the single NotifManager poll loop thread to rate-limit
+  // repeated summaries for the same consecutive flush episode.
+  uint64_t flushSummaryStreak_{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -150,8 +207,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
-                     NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port,
+                     const RdmaBackendConfig& config, RdmaManager*, NotifManager*);
   ~ControlPlaneServer();
 
   std::optional<uint16_t> GetListenPort() const {
@@ -162,9 +219,10 @@ class ControlPlaneServer {
   // Remote engine meta management
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
+  std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
 
   // Endpoint management
-  void BuildRdmaConn(EngineKey, TopoKeyPair);
+  void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
 
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
@@ -179,9 +237,11 @@ class ControlPlaneServer {
  private:
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
+  void DropConnection(int fd) noexcept;
 
  private:
   EngineKey myEngKey;
+  RdmaBackendConfig config{};
 
   mutable std::mutex mu;
 
@@ -203,9 +263,10 @@ class ControlPlaneServer {
 class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
-  RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
-                     Executor* executor);
+  RdmaBackendSession(const RdmaBackendConfig& config,
+                     std::vector<application::RdmaMemoryRegion> localMrPerEp,
+                     std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
+                     Executor* executor, MemoryLocationType localLoc = MemoryLocationType::CPU);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -219,10 +280,13 @@ class RdmaBackendSession : public BackendSession {
 
  private:
   RdmaBackendConfig config{};
-  application::RdmaMemoryRegion local{};
-  application::RdmaMemoryRegion remote{};
+  std::vector<application::RdmaMemoryRegion> localMrPerEp{};
+  std::vector<application::RdmaMemoryRegion> remoteMrPerEp{};
   EpPairVec eps{};
   Executor* executor{nullptr};
+  MemoryLocationType localLoc_{MemoryLocationType::CPU};
+  std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
+      std::make_shared<std::atomic<bool>>(false)};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -234,24 +298,28 @@ class RdmaBackend : public Backend {
   RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
+  static bool HasActiveDevices();
+
   std::optional<uint16_t> GetListenPort() const {
     if (!server) return std::nullopt;
     return server->GetListenPort();
   }
 
-  void RegisterRemoteEngine(const EngineDesc&);
-  void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(MemoryDesc& desc);
-  void DeregisterMemory(const MemoryDesc& desc);
+  void RegisterRemoteEngine(const EngineDesc&) override;
+  void DeregisterRemoteEngine(const EngineDesc&) override;
+  void RegisterMemory(MemoryDesc& desc) override;
+  void DeregisterMemory(const MemoryDesc& desc) override;
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
-                 bool isRead);
+                 bool isRead) override;
   void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                       const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                      bool isRead);
-  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
-  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+                      bool isRead) override;
+  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                TransferStatus* status) override;
+  bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
@@ -278,8 +346,24 @@ class RdmaBackend : public Backend {
       return seed;
     }
   };
+  struct ConnBuildKey {
+    EngineKey remoteEngineKey;
+    TopoKeyPair topo;
+    bool operator==(const ConnBuildKey& o) const {
+      return remoteEngineKey == o.remoteEngineKey && topo == o.topo;
+    }
+  };
+  struct ConnBuildKeyHash {
+    std::size_t operator()(const ConnBuildKey& k) const noexcept {
+      std::size_t topoHash = std::hash<TopoKeyPair>{}(k.topo);
+      std::size_t engineHash = std::hash<std::string>{}(k.remoteEngineKey);
+      return topoHash ^ (engineHash + 0x9e3779b97f4a7c15ULL + (topoHash << 6) + (topoHash >> 2));
+    }
+  };
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
+  std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
+                                               const TopoKeyPair& topo);
 
  private:
   EngineKey myEngKey;
@@ -292,6 +376,8 @@ class RdmaBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+  std::mutex connBuildMapMu_;
+  std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
 };
 
 }  // namespace io

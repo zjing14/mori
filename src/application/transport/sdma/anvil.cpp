@@ -1,41 +1,60 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /**
  * @acknowledgements:
  * - Original implementation by: Sidler, David
  * - Source: https://github.com/AARInternal/shader_sdma
- * 
+ *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-
-namespace anvil
-{
+#include <stdexcept>
+namespace anvil {
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
-   if (s != HSA_STATUS_SUCCESS)
-   {
-      const char* hsa_err_msg;
-      hsa_status_string(s, &hsa_err_msg);
-      throw(std::runtime_error{std::string("HSA error at ") + file + std::string(":") + std::to_string(line) +
-                               std::string(" - ") + hsa_err_msg});
-   }
+  if (s != HSA_STATUS_SUCCESS) {
+    const char* hsa_err_msg;
+    hsa_status_string(s, &hsa_err_msg);
+    throw(std::runtime_error{std::string("HSA error at ") + file + std::string(":") +
+                             std::to_string(line) + std::string(" - ") + hsa_err_msg});
+  }
 };
 
 #define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                                                \
-   do                                                                                                                  \
-   {                                                                                                                   \
-      if ((call) != HSAKMT_STATUS_SUCCESS)                                                                             \
-      {                                                                                                                \
-         std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__                       \
-                   << ", Line: " << __LINE__ << ")" << std::endl;                                                      \
-         exit(EXIT_FAILURE);                                                                                           \
-      }                                                                                                                \
-   } while (0)
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
+  do {                                                                                        \
+    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
+      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
+                << ", Line: " << __LINE__ << ")" << std::endl;                                \
+      exit(EXIT_FAILURE);                                                                     \
+    }                                                                                         \
+  } while (0)
 
 #if 0
 inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
@@ -75,38 +94,32 @@ std::vector<hsa_agent_t> cpuAgents_;
 std::vector<hsa_agent_t> gpuAgents_;
 
 hsa_status_t rocm_hsa_agent_callback(hsa_agent_t agent, hsa_device_type_t target_device_type,
-                                     [[maybe_unused]] void* vector)
-{
-   std::vector<hsa_agent_t>* agents = static_cast<std::vector<hsa_agent_t>*>(vector);
-   hsa_device_type_t device_type{};
-   hsa_status_t status{hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type)};
-   if (status != HSA_STATUS_SUCCESS)
-   {
-      printf("Failure to get device type: 0x%x", status);
-      return status;
-   }
-   if (device_type == target_device_type)
-   {
-      agents->push_back(agent);
-   }
-   return status;
+                                     [[maybe_unused]] void* vector) {
+  std::vector<hsa_agent_t>* agents = static_cast<std::vector<hsa_agent_t>*>(vector);
+  hsa_device_type_t device_type{};
+  hsa_status_t status{hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type)};
+  if (status != HSA_STATUS_SUCCESS) {
+    printf("Failure to get device type: 0x%x", status);
+    return status;
+  }
+  if (device_type == target_device_type) {
+    agents->push_back(agent);
+  }
+  return status;
 }
 
-hsa_status_t rocm_hsa_gpu_agent_callback(hsa_agent_t agent, [[maybe_unused]] void* context)
-{
-   return rocm_hsa_agent_callback(agent, HSA_DEVICE_TYPE_GPU, context);
+hsa_status_t rocm_hsa_gpu_agent_callback(hsa_agent_t agent, [[maybe_unused]] void* context) {
+  return rocm_hsa_agent_callback(agent, HSA_DEVICE_TYPE_GPU, context);
 }
-hsa_status_t rocm_hsa_cpu_agent_callback(hsa_agent_t agent, [[maybe_unused]] void* context)
-{
-   return rocm_hsa_agent_callback(agent, HSA_DEVICE_TYPE_CPU, context);
+hsa_status_t rocm_hsa_cpu_agent_callback(hsa_agent_t agent, [[maybe_unused]] void* context) {
+  return rocm_hsa_agent_callback(agent, HSA_DEVICE_TYPE_CPU, context);
 }
 
-void SetUpKFD()
-{
-   CHECK_HSAKMT_SUCCESS(hsaKmtOpenKFD(), "hsaKmtOpenKFD() failed!");
-   HsaSystemProperties m_SystemProperties;
-   memset(&m_SystemProperties, 0, sizeof(m_SystemProperties));
-   CHECK_HSAKMT_SUCCESS(hsaKmtAcquireSystemProperties(&m_SystemProperties), "Failed!");
+void SetUpKFD() {
+  CHECK_HSAKMT_SUCCESS(hsaKmtOpenKFD(), "hsaKmtOpenKFD() failed!");
+  HsaSystemProperties m_SystemProperties;
+  memset(&m_SystemProperties, 0, sizeof(m_SystemProperties));
+  CHECK_HSAKMT_SUCCESS(hsaKmtAcquireSystemProperties(&m_SystemProperties), "Failed!");
 }
 
 // void SetUpKFD(uint32_t targetDevice) {
@@ -117,221 +130,239 @@ void SetUpKFD()
 //     std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
 // }
 
-void CloseKFD()
-{
-   CHECK_HSAKMT_SUCCESS(hsaKmtCloseKFD(), "hsaKmtCloseKFD() failed");
-}
+void CloseKFD() { (void)hsaKmtCloseKFD(); }
 
 // Convert a logical deviceId index to the NVML device minor number
-static const std::string getBusId(int deviceId)
-{
-   // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
-   // format. Still need to allocate proper space in case PCI domain goes
-   // higher.
-   char busIdChar[] = "00000000:00:00.0";
-   CHECK_HIP_ERROR(hipDeviceGetPCIBusId(busIdChar, sizeof(busIdChar), deviceId));
-   // we need the hex in lower case format
-   for (size_t i = 0; i < sizeof(busIdChar); i++)
-   {
-      busIdChar[i] = std::tolower(busIdChar[i]);
-   }
-   return std::string(busIdChar);
+static const std::string getBusId(int deviceId) {
+  // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
+  // format. Still need to allocate proper space in case PCI domain goes
+  // higher.
+  char busIdChar[] = "00000000:00:00.0";
+  CHECK_HIP_ERROR(hipDeviceGetPCIBusId(busIdChar, sizeof(busIdChar), deviceId));
+  // we need the hex in lower case format
+  for (size_t i = 0; i < sizeof(busIdChar); i++) {
+    busIdChar[i] = std::tolower(busIdChar[i]);
+  }
+  return std::string(busIdChar);
 }
 
-SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent, uint32_t engineId)
-    : remoteDeviceId_(remoteDeviceId)
-{
-   // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
-   // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
-   int originalDeviceId;
+SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
+                     uint32_t engineId)
+    : remoteDeviceId_(remoteDeviceId) {
+  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
+  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
+  int originalDeviceId;
 
-   CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId)); // Save the current device
-    
+  CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId));  // Save the current device
 
-   uint32_t localNodeId;
-   hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
-   if (status != HSA_STATUS_SUCCESS)
-   {
-      printf("Failure to get device info: 0x%x", status);
-      //return status;
-   }
+  uint32_t localNodeId;
+  hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
+  if (status != HSA_STATUS_SUCCESS) {
+    printf("Failure to get device info: 0x%x", status);
+    // return status;
+  }
 
-   // std::cout << "Allocating queue for engine " << engineId << " on device " << localDeviceId << "
-   // to device "
-   //           << remoteDeviceId << std::endl;
-   // std::cout << "original device id: " << originalDeviceId << " local " << localDeviceId << "
-   // remote " << remoteDeviceId
-   //           << " local node " << localNodeId << std::endl;
+  // Allocate SDMA queue buffer on device side, requires ExecuteAccess
+  HsaMemFlags memFlags = {};
+  memFlags.ui32.NonPaged = 1;
+  memFlags.ui32.HostAccess = 1;
+  memFlags.ui32.PageSize = HSA_PAGE_SIZE_4KB;
+  memFlags.ui32.NoNUMABind = 1;
+  memFlags.ui32.ExecuteAccess = 1;
+  memFlags.ui32.Uncached = 1;
 
-   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
-   HsaMemFlags memFlags = {};
-   memFlags.ui32.NonPaged = 1;
-   memFlags.ui32.HostAccess = 1;
-   memFlags.ui32.PageSize = HSA_PAGE_SIZE_4KB;
-   memFlags.ui32.NoNUMABind = 1;
-   memFlags.ui32.ExecuteAccess = 1;
-   memFlags.ui32.Uncached = 1;
-   
-   std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
-   std::flush;
+  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+  // std::flush;
 
+  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+                       "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
 
-   CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_), "Failed");
-   CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
+  // Create SDMA Queue
+  // TODO needed here?
+  memset(&queue_, 0, sizeof(HsaQueueResource));
 
-   // Create SDMA Queue
-   // TODO needed here?
-   memset(&queue_, 0, sizeof(HsaQueueResource));
+  CHECK_HSAKMT_SUCCESS(
+      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
+      "Failed");
 
-   CHECK_HSAKMT_SUCCESS(hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, DEFAULT_QUEUE_PERCENTAGE,
-                                             DEFAULT_PRIORITY, engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr,
-                                             &queue_),
-                        "Failed");
+  // Populate Device Handle
+  // TODO uncached
+  CHECK_HIP_ERROR(hipMalloc(&deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
+  CHECK_HIP_ERROR(
+      hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+  CHECK_HIP_ERROR(
+      hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
 
-   // Populate Device Handle
-   // TODO uncached
-   CHECK_HIP_ERROR(hipMalloc(&deviceHandle_, sizeof(SdmaQueueDeviceHandle)));
-   CHECK_HIP_ERROR(hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
-   CHECK_HIP_ERROR(hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+  uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  SdmaQueueDeviceHandle handle = {
+      .queueBuf = static_cast<uint32_t*>(queueBuffer_),
+      .rptr = queue_.Queue_read_ptr_aql,
+      .wptr = queue_.Queue_write_ptr_aql,
+      .doorbell = queue_.Queue_DoorBell_aql,
+      .cachedWptr = cachedWptr_,
+      .committedWptr = committedWptr_,
+      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
+  };
 
-   uint64_t cachedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
-   uint64_t committedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
-   SdmaQueueDeviceHandle handle = {
-       .queueBuf = static_cast<uint32_t*>(queueBuffer_),
-       .rptr = queue_.Queue_read_ptr_aql,
-       .wptr = queue_.Queue_write_ptr_aql,
-       .doorbell = queue_.Queue_DoorBell_aql,
-       .cachedWptr = cachedWptr_,
-       .committedWptr = committedWptr_,
-       .cachedHwReadIndex = (uint64_t) * (queue_.Queue_read_ptr_aql),
-   };
-
-   CHECK_HIP_ERROR(hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
-   CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
-   CHECK_HIP_ERROR(hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+  CHECK_HIP_ERROR(
+      hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
+  CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+  CHECK_HIP_ERROR(
+      hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
 }
 
-SdmaQueue::~SdmaQueue()
-{
-   // TODO catch exception?
-   CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
-   CHECK_HIP_ERROR(hipFree(deviceHandle_));
-   CHECK_HIP_ERROR(hipFree(cachedWptr_));
-   CHECK_HIP_ERROR(hipFree(committedWptr_));
-   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
-   CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
+SdmaQueue::~SdmaQueue() {
+  CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
+  CHECK_HIP_ERROR(hipFree(deviceHandle_));
+  CHECK_HIP_ERROR(hipFree(cachedWptr_));
+  CHECK_HIP_ERROR(hipFree(committedWptr_));
+  CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
 }
 
-SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const
-{
-   return deviceHandle_;
+SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
+
+AnvilLib::~AnvilLib() {
+  for (auto& p : sdma_channels_) {
+    p.second.clear();
+  }
+  CloseKFD();
+  hsa_shut_down();
 }
 
-AnvilLib::~AnvilLib()
-{
-   for (auto& p : sdma_channels_)
-   {
-      p.second.clear();
-   }
-   CloseKFD();
-   hsa_shut_down();
+void AnvilLib::init() {
+  std::call_once(init_flag, []() {
+    //   std::atexit(CloseKFD); // Register cleanup
+
+    // HSA
+    hsa_status_t status{hsa_init()};
+    if (status != HSA_STATUS_SUCCESS) {
+      printf("Failure to open HSA connection: 0x%x", status);
+      // return 1;
+    }
+    status = hsa_iterate_agents(&rocm_hsa_gpu_agent_callback, &gpuAgents_);
+    if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+      printf("Failure to iterate HSA agents: 0x%x", status);
+      // return 1;
+    }
+    status = hsa_iterate_agents(&rocm_hsa_cpu_agent_callback, &cpuAgents_);
+    if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+      printf("Failure to iterate HSA agents: 0x%x", status);
+      // return 1;
+    }
+
+    SetUpKFD();
+  });
 }
 
-void AnvilLib::init()
-{
-   std::call_once(init_flag, []() {
-      //   std::atexit(CloseKFD); // Register cleanup
+bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  // Spread the channels across the engines recommended for this peer link. On
+  // MI350 the mask typically reports 2 engines per peer; on platforms with a
+  // single recommended engine all channels share it.
+  std::vector<uint32_t> engines;
+  if (srcDeviceId == dstDeviceId) {
+    // A loopback copy never traverses xGMI and has no self io_link, so KFD
+    // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
+    engines.push_back(0);
+  } else {
+    uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
+    for (uint32_t b = 0; b < 32; ++b) {
+      if (mask & (1u << b)) engines.push_back(b);
+    }
+    // Fall back to the static OAM table if KFD did not report a mask.
+    if (engines.empty()) {
+      int e = getSdmaEngineId(srcDeviceId, dstDeviceId);
+      engines.push_back(e);
+    }
+  }
+  int numEngines = static_cast<int>(engines.size());
 
-      // HSA
-      hsa_status_t status{hsa_init()};
-      if (status != HSA_STATUS_SUCCESS)
-      {
-         printf("Failure to open HSA connection: 0x%x", status);
-         //return 1;
-      }
-      status = hsa_iterate_agents(&rocm_hsa_gpu_agent_callback, &gpuAgents_);
-      if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK)
-      {
-         printf("Failure to iterate HSA agents: 0x%x", status);
-         //return 1;
-      }
-      status = hsa_iterate_agents(&rocm_hsa_cpu_agent_callback, &cpuAgents_);
-      if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK)
-      {
-         printf("Failure to iterate HSA agents: 0x%x", status);
-         //return 1;
-      }
-
-      SetUpKFD();
-   });
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
+  for (int c = 0; c < numChannels; ++c) {
+    uint32_t engineId = engines[c % numEngines];
+    sdma_channels_[key].emplace_back(
+        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
+  }
+  return true;
 }
 
-bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels)
-{
-   uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId); // + 1) * 2;
-   std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
-             << " channels using engine " << engineId << std::endl;
-   for (int c = 0; c < numChannels; ++c)
-   {
-      sdma_channels_[dstDeviceId].emplace_back(
-          std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
-   }
-   return true;
+uint32_t AnvilLib::getNodeId(int deviceId) {
+  uint32_t nodeId = 0;
+  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[deviceId], HSA_AGENT_INFO_NODE, &nodeId));
+  return nodeId;
 }
 
-SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx)
-{
-   if (sdma_channels_.find(dstDeviceId) == sdma_channels_.end())
-   {
-      return nullptr;
-   }
+uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
+  uint32_t srcNode = getNodeId(srcDeviceId), dstNode = getNodeId(dstDeviceId);
 
-   if (!(channel_idx < sdma_channels_[dstDeviceId].size()))
-   {
-      return nullptr;
-   }
+  HsaNodeProperties props{};
+  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
+    return 0;
+  }
 
-   return sdma_channels_[dstDeviceId][channel_idx].get(); // TODO
+  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
+  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
+      HSAKMT_STATUS_SUCCESS) {
+    return 0;
+  }
+  for (const auto& link : links) {
+    if (link.NodeTo == dstNode) {
+      return link.RecSdmaEngIdMask;
+    }
+  }
+  return 0;
 }
 
-AnvilLib& AnvilLib::getInstance()
-{
-   static AnvilLib *instance;
-   if (instance == nullptr) {
-     instance = new AnvilLib();
-   }
-   return *instance;
+SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
+  auto it = sdma_channels_.find(key);
+  if (it == sdma_channels_.end()) {
+    return nullptr;
+  }
+  if (!(channel_idx < static_cast<int>(it->second.size()))) {
+    return nullptr;
+  }
+  return it->second[channel_idx].get();
 }
 
-int AnvilLib::getOamId(int deviceId)
-{
-   std::string busId = getBusId(deviceId);
-   std::string file_str = "/sys/bus/pci/devices/" + busId + "/xgmi_physical_id";
-   std::ifstream file(file_str);
-   int xgmi_physical_id;
-   if (file.is_open())
-   {
-      if (!(file >> xgmi_physical_id))
-      {
-         throw std::runtime_error("Failed to read xGMI physical id from file: " + file_str);
-      }
-   }
-   else
-   {
-      throw std::runtime_error("Failed to open file: " + file_str);
-   }
-   return xgmi_physical_id;
+AnvilLib& AnvilLib::getInstance() {
+  // Keep pre-SDMA-collective behavior: do not run ~AnvilLib during process teardown.
+  // Worker exits can otherwise stall in ROCm/HSA shutdown ordering.
+  static AnvilLib* instance;
+  if (instance == nullptr) {
+    instance = new AnvilLib();
+  }
+  return *instance;
 }
 
-int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId)
-{
-   int srcOamId = getOamId(srcDeviceId);
-   int dstOamId = getOamId(dstDeviceId);
+int AnvilLib::getOamId(int deviceId) {
+  std::string busId = getBusId(deviceId);
+  std::string file_str = "/sys/bus/pci/devices/" + busId + "/xgmi_physical_id";
+  std::ifstream file(file_str);
+  int xgmi_physical_id;
+  if (file.is_open()) {
+    if (!(file >> xgmi_physical_id)) {
+      throw std::runtime_error("Failed to read xGMI physical id from file: " + file_str);
+    }
+  } else {
+    throw std::runtime_error("Failed to open file: " + file_str);
+  }
+  return xgmi_physical_id;
+}
 
-   // Use even engines only
-   return mi300xOamMap[srcOamId][dstOamId] * 2;
+int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
+  int srcOamId = getOamId(srcDeviceId);
+  int dstOamId = getOamId(dstDeviceId);
+
+  // Use even engines only
+  return mi300xOamMap[srcOamId][dstOamId] * 2;
 }
 
 AnvilLib& anvil = anvil.getInstance();
 
-} // namespace anvil
+}  // namespace anvil

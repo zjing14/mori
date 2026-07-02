@@ -34,10 +34,45 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
+#include "mori/hip_compat.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
+
+// mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
+// TUs need not include <infiniband/verbs.h>. This host TU sees both — guard the
+// 1:1 value parity here so any future drift is a compile error.
+#define MORI_WC_STATUS_PARITY(x)                                                        \
+  static_assert(static_cast<int>(::mori::core::WC_##x) == static_cast<int>(IBV_WC_##x), \
+                "mori::core::WcStatus drifted from ibv_wc_status")
+MORI_WC_STATUS_PARITY(SUCCESS);
+MORI_WC_STATUS_PARITY(LOC_LEN_ERR);
+MORI_WC_STATUS_PARITY(LOC_QP_OP_ERR);
+MORI_WC_STATUS_PARITY(LOC_EEC_OP_ERR);
+MORI_WC_STATUS_PARITY(LOC_PROT_ERR);
+MORI_WC_STATUS_PARITY(WR_FLUSH_ERR);
+MORI_WC_STATUS_PARITY(MW_BIND_ERR);
+MORI_WC_STATUS_PARITY(BAD_RESP_ERR);
+MORI_WC_STATUS_PARITY(LOC_ACCESS_ERR);
+MORI_WC_STATUS_PARITY(REM_INV_REQ_ERR);
+MORI_WC_STATUS_PARITY(REM_ACCESS_ERR);
+MORI_WC_STATUS_PARITY(REM_OP_ERR);
+MORI_WC_STATUS_PARITY(RETRY_EXC_ERR);
+MORI_WC_STATUS_PARITY(RNR_RETRY_EXC_ERR);
+MORI_WC_STATUS_PARITY(LOC_RDD_VIOL_ERR);
+MORI_WC_STATUS_PARITY(REM_INV_RD_REQ_ERR);
+MORI_WC_STATUS_PARITY(REM_ABORT_ERR);
+MORI_WC_STATUS_PARITY(INV_EECN_ERR);
+MORI_WC_STATUS_PARITY(INV_EEC_STATE_ERR);
+MORI_WC_STATUS_PARITY(FATAL_ERR);
+MORI_WC_STATUS_PARITY(RESP_TIMEOUT_ERR);
+MORI_WC_STATUS_PARITY(GENERAL_ERR);
+MORI_WC_STATUS_PARITY(TM_ERR);
+MORI_WC_STATUS_PARITY(TM_RNDV_INCOMPLETE);
+#undef MORI_WC_STATUS_PARITY
 
 namespace mori {
 namespace application {
@@ -175,19 +210,37 @@ GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
   result.gidIdx = configuredGidIdx;
   if (!context) return result;
 
+  int gidTableLen = portAttr ? static_cast<int>(portAttr->gid_tbl_len) : 0;
+
   if (configuredGidIdx >= 0) {
     result.fromUser = true;
     if (QueryGidAtIndex(context, portId, configuredGidIdx, portAttr, &result.gid,
                         &result.gidType)) {
       result.valid = true;
     } else {
-      MORI_APP_WARN("Failed to query user-specified gid index {} on port {}", configuredGidIdx,
-                    portId);
+      if (gidTableLen > 0 && configuredGidIdx >= gidTableLen) {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}: index is outside the "
+            "device-reported gid table length {}. Hint: unset MORI_IB_GID_INDEX to let MORI "
+            "auto-select a valid GID, or choose an index in [0, {}).",
+            configuredGidIdx, portId, gidTableLen, gidTableLen);
+      } else if (gidTableLen > 0) {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}. Hint: unset "
+            "MORI_IB_GID_INDEX to let MORI auto-select a valid GID, or choose a valid entry "
+            "from the device gid table (reported length {}).",
+            configuredGidIdx, portId, gidTableLen);
+      } else {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}. Hint: unset "
+            "MORI_IB_GID_INDEX to let MORI auto-select a valid GID, or inspect available "
+            "indices with show_gids / ibv_devinfo and choose a valid one.",
+            configuredGidIdx, portId);
+      }
     }
     return result;
   }
 
-  int gidTableLen = portAttr ? static_cast<int>(portAttr->gid_tbl_len) : 0;
   if (gidTableLen <= 0) gidTableLen = 128;  // Conservative fallback
 
   int bestScore = INT_MIN;
@@ -228,7 +281,11 @@ GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
     MORI_APP_TRACE("Auto-selected GID index {} (type={}) on port {}", bestIdx,
                    static_cast<int>(bestType), portId);
   } else {
-    MORI_APP_ERROR("Failed to auto-detect a valid GID on port {}", portId);
+    MORI_APP_ERROR(
+        "Failed to auto-detect a valid GID on port {}. Hint: inspect available GIDs with "
+        "show_gids / ibv_devinfo, then set MORI_IB_GID_INDEX to a valid entry if auto-selection "
+        "is unsuitable for this environment.",
+        portId);
   }
 
   return result;
@@ -292,6 +349,7 @@ int MaybeAddRelaxedOrderingFlag(int accessFlag) {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {
   InitializeUdpSportConfiguration();
+  dmabufRegDisabled = env::IsEnvVarEnabled("MORI_DISABLE_DMABUF_REG");
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
@@ -334,9 +392,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
                                                                                 int dmabuf_fd,
                                                                                 int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr =
-      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
-                        effectiveAccessFlag);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
+                                 effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "
@@ -356,11 +413,64 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   return handle;
 }
 
+// Export a dmabuf fd for the GPU buffer at `ptr`. Returns -1 if unsupported.
+static int TryExportDmabufFd(void* ptr, size_t size) {
+  int fd = -1;
+  hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
+                                                  hipMemRangeHandleTypeDmaBufFd, 0);
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    return -1;
+  }
+  return fd;
+}
+
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
+                                                                              size_t size,
+                                                                              int accessFlag) {
+  if (!dmabufRegDisabled) {
+    int dmabufFd = TryExportDmabufFd(ptr, size);
+    if (dmabufFd >= 0) {
+      int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+      ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
+                                     effectiveAccessFlag);
+      close(dmabufFd);
+      if (mr) {
+        MORI_APP_TRACE("RegisterRdmaMemoryRegionAuto[dmabuf], addr:{}, size:{}, lkey:{}, rkey:{}",
+                       ptr, size, mr->lkey, mr->rkey);
+        mrPool.insert({ptr, mr});
+        application::RdmaMemoryRegion handle;
+        handle.addr = reinterpret_cast<uintptr_t>(ptr);
+        handle.lkey = mr->lkey;
+        handle.rkey = mr->rkey;
+        handle.length = mr->length;
+        return handle;
+      }
+      MORI_APP_WARN(
+          "ibv_reg_dmabuf_mr failed (addr:{}, size:{}, errno:{} ({})), falling back to "
+          "ibv_reg_mr",
+          ptr, size, errno, strerror(errno));
+    }
+  }
+  return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
+}
+
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
   ibv_dereg_mr(mr);
   mrPool.erase(ptr);
+}
+
+bool RdmaDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    MORI_APP_WARN(
+        "DestroyRdmaEndpointNoThrow is unsupported for provider vendorId={} qpn={} cq={}; "
+        "leaving endpoint for normal context teardown",
+        static_cast<uint32_t>(ep.vendorId), ep.handle.qpn, static_cast<void*>(ep.ibvHandle.cq));
+  } catch (...) {
+  }
+  return false;
 }
 
 ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
@@ -493,7 +603,12 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(&nums_device);
   MORI_APP_TRACE("ibv_get_device_list nums_device: {}", nums_device);
-  Initialize();
+  // ibv_get_device_list returns nullptr when libibverbs cannot be loaded (see
+  // ibv_shim.cpp) or device enumeration fails. Treat this the same as "no RDMA
+  // devices": leave rdmaDeviceList empty instead of dereferencing a null array
+  // in Initialize(). Single-node / intranode runs need no RDMA device and the
+  // upper layers already handle an empty list gracefully.
+  if (deviceList != nullptr) Initialize();
 }
 
 RdmaContext::~RdmaContext() {
@@ -518,18 +633,26 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   } else if (backendType == RdmaBackendType::DirectVerbs) {
     switch (device_attr_ex.orig_attr.vendor_id) {
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
+        if (!Mlx5DvApi::Available()) {
+          MORI_APP_ERROR("MLX5 device detected but libmlx5.so not available at runtime");
+          return nullptr;
+        }
         return new Mlx5Device(inDevice);
         break;
-#ifdef ENABLE_BNXT
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)):
+        if (!BnxtDvApi::Available()) {
+          MORI_APP_ERROR("BNXT device detected but libbnxt_re.so not available at runtime");
+          return nullptr;
+        }
         return new BnxtDevice(inDevice);
         break;
-#endif
-#ifdef ENABLE_IONIC
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
+        if (!IonicDvApi::Available()) {
+          MORI_APP_ERROR("IONIC device detected but libionic.so not available at runtime");
+          return nullptr;
+        }
         return new IonicDevice(inDevice);
         break;
-#endif
       default:
         return nullptr;
     }

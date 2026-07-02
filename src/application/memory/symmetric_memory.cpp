@@ -24,11 +24,12 @@
 #include <fcntl.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <vector>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
@@ -74,8 +75,17 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  // HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
-  HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  // Use the Context-cached snapshot rather than getenv() so this stays
+  // consistent with the transport selection that was made when the Context
+  // was constructed. Without this, late env mutations (e.g. a test setting
+  // MORI_ENABLE_SDMA after worker init) flip allocations to uncached
+  // hipExtMallocWithFlags while transport selection still believes P2P,
+  // producing cache/IPC inconsistency hangs.
+  if (context.IsSdmaEnabled()) {
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
+  } else {
+    HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  }
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }
@@ -103,6 +113,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange pointers (RDMA virtual addresses)
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -116,23 +127,45 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
-  
+
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
-  
-  // Open IPC handles for all same-node peers to establish P2P data path
-  // This happens regardless of transport type selection
+
+  // Open IPC handles for all same-node peers to establish P2P data path.
+  // Skip same-process peers: hipIpcOpenMemHandle fails within the same process;
+  // the peer's pointer is already valid and can be used directly.
   for (int i = 0; i < worldSize; i++) {
     if (!context.CanUseP2P(i)) continue;
-
+    if (context.SameProcessP2P(i)) {
+      // Direct pointer access — no IPC handle needed within the same process.
+      // We must still enable peer access from our current device to the peer's
+      // device, because hipIpcOpenMemHandle's lazy-enable path is skipped here.
+      cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
+      hipPointerAttribute_t attr{};
+      hipError_t attrErr =
+          hipPointerGetAttributes(&attr, reinterpret_cast<const void*>(cpuMemObj->peerPtrs[i]));
+      if (attrErr == hipSuccess && attr.device != hipInvalidDeviceId) {
+        hipError_t peerErr = hipDeviceEnablePeerAccess(attr.device, 0);
+        (void)hipGetLastError();
+        if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
+          MORI_APP_WARN("hipDeviceEnablePeerAccess(peer={}) failed: {}", attr.device,
+                        hipGetErrorString(peerErr));
+        }
+      } else {
+        (void)hipGetLastError();
+        MORI_APP_WARN("hipPointerGetAttributes failed for same-process peer {} ptr {:p}: {}", i,
+                      reinterpret_cast<void*>(cpuMemObj->peerPtrs[i]), hipGetErrorString(attrErr));
+      }
+      continue;
+    }
     HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
   }
-  
+
   // Update peerPtrs based on transport type:
   // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
   // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
@@ -148,8 +181,22 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   cpuMemObj->peerRkeys[rank] = 0;
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
-  if (rdmaDeviceContext) {
-    application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
+  // Only register the symmetric buffer as an RDMA MR if at least one peer is
+  // actually reachable via RDMA. Otherwise (e.g. single-node 2-GPU runs that
+  // use only P2P/SDMA) ibv_reg_mr can still fail -- typically EINVAL on large
+  // heaps when the host's memlock/IB stack rejects the registration -- and
+  // bring down init even though no RDMA traffic will ever flow.
+  bool anyRdmaPeer = false;
+  for (int i = 0; i < worldSize; i++) {
+    if (i == rank) continue;
+    if (context.GetTransportType(i) == TransportType::RDMA) {
+      anyRdmaPeer = true;
+      break;
+    }
+  }
+  if (rdmaDeviceContext && anyRdmaPeer) {
+    application::RdmaMemoryRegion mr =
+        rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
   }
@@ -175,31 +222,86 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    if (i == rank) continue;
     dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
   if (dstDeviceIds.size() != 0) {
     int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    HIP_RUNTIME_CHECK(hipMalloc(
-        &gpuMemObj->deviceHandles_d,
-        dstDeviceIds.size() * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
+    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    size_t numDevices = static_cast<size_t>(worldSize);
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&gpuMemObj->deviceHandles_d,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(
+        hipMemset(gpuMemObj->deviceHandles_d, 0,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q] =
-            anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        HIP_RUNTIME_CHECK(hipMemcpy(
+            &gpuMemObj
+                 ->deviceHandles_d[static_cast<size_t>(dstDeviceId) * numOfQueuesPerDevice + q],
+            &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, signalArraySize));
+
+    // Exchange signal memory via IPC so each PE can write to remote PE's signalPtrs.
+    // Also allgather raw pointers for same-process peers (SPMT) where IPC fails.
+    hipIpcMemHandle_t signalHandle;
+    HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, gpuMemObj->signalPtrs));
+
+    auto* signalHandles =
+        static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+    bootNet.Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
+
+    HSAuint64* mySignalPtr = gpuMemObj->signalPtrs;
+    auto* rawSignalPtrs = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
+    bootNet.Allgather(&mySignalPtr, rawSignalPtrs, sizeof(HSAuint64*));
+
+    auto* peerSignalPtrsHost = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
+    peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      if (i == rank) continue;
+      if (context.SameProcessP2P(i)) {
+        peerSignalPtrsHost[i] = rawSignalPtrs[i];
+        hipPointerAttribute_t attr{};
+        hipError_t attrErr = hipPointerGetAttributes(&attr, rawSignalPtrs[i]);
+        if (attrErr == hipSuccess && attr.device != hipInvalidDeviceId) {
+          hipError_t peerErr = hipDeviceEnablePeerAccess(attr.device, 0);
+          (void)hipGetLastError();
+          if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
+            MORI_APP_WARN("hipDeviceEnablePeerAccess(peer={}) failed for SDMA signal: {}",
+                          attr.device, hipGetErrorString(peerErr));
+          }
+        } else {
+          (void)hipGetLastError();
+          MORI_APP_WARN(
+              "hipPointerGetAttributes failed for same-process SDMA signal peer {} ptr {:p}: {}", i,
+              reinterpret_cast<void*>(rawSignalPtrs[i]), hipGetErrorString(attrErr));
+        }
+        continue;
+      }
+      void* mappedPtr = nullptr;
+      HIP_RUNTIME_CHECK(
+          hipIpcOpenMemHandle(&mappedPtr, signalHandles[i], hipIpcMemLazyEnablePeerAccess));
+      peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
+    }
+    free(rawSignalPtrs);
+
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerSignalPtrs, sizeof(HSAuint64*) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerSignalPtrs, peerSignalPtrsHost,
+                                sizeof(HSAuint64*) * worldSize, hipMemcpyHostToDevice));
+    cpuMemObj->peerSignalPtrsHost = peerSignalPtrsHost;
+    free(signalHandles);
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
@@ -217,12 +319,36 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
-  
-  // Close IPC handles for peers that had P2P connection
+  SymmMemObj gpuMemObjHost{};
+  bool haveGpuMemObjHost = false;
+  hipError_t copyErr =
+      hipMemcpy(&gpuMemObjHost, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost);
+  if (copyErr == hipSuccess) {
+    haveGpuMemObjHost = true;
+  } else {
+    MORI_APP_WARN("hipMemcpy failed for GPU SymmMemObj during deregistration: {}",
+                  hipGetErrorString(copyErr));
+    (void)hipGetLastError();
+  }
+
+  auto freeGpuMetadata = [](void* ptr, const char* name) {
+    if (ptr == nullptr) return;
+    hipError_t err = hipFree(ptr);
+    if (err != hipSuccess) {
+      MORI_APP_WARN("hipFree failed for GPU metadata {} ptr {:p}: {}", name, ptr,
+                    hipGetErrorString(err));
+      (void)hipGetLastError();
+    }
+  };
+
+  // Close IPC handles for peers that had P2P connection.
+  // Skip same-process peers: their p2pPeerPtrs are direct VA pointers, not
+  // IPC-mapped, so hipIpcCloseMemHandle would fail.
   int rank = bootNet.GetLocalRank();
   int worldSize = bootNet.GetWorldSize();
   for (int i = 0; i < worldSize; i++) {
     if (!context.CanUseP2P(i)) continue;
+    if (context.SameProcessP2P(i)) continue;
     if (memObjPtr.cpu->p2pPeerPtrs && memObjPtr.cpu->p2pPeerPtrs[i] != 0) {
       void* peerPtr = reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i]);
       hipError_t closeErr = hipIpcCloseMemHandle(peerPtr);
@@ -234,16 +360,42 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
       }
     }
   }
-  
+
+  // Close SDMA signal IPC handles for non-same-process peers and free SDMA GPU resources
+  if (memObjPtr.cpu->peerSignalPtrsHost) {
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      if (i == rank) continue;
+      if (context.SameProcessP2P(i)) continue;
+      if (memObjPtr.cpu->peerSignalPtrsHost[i] != nullptr) {
+        hipError_t closeErr =
+            hipIpcCloseMemHandle(reinterpret_cast<void*>(memObjPtr.cpu->peerSignalPtrsHost[i]));
+        if (closeErr != hipSuccess) {
+          MORI_APP_WARN("hipIpcCloseMemHandle failed for SDMA signal peer {}: {}", i,
+                        hipGetErrorString(closeErr));
+        }
+      }
+    }
+    free(memObjPtr.cpu->peerSignalPtrsHost);
+  }
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.signalPtrs, "signalPtrs");
+    freeGpuMetadata(gpuMemObjHost.expectSignalsPtr, "expectSignalsPtr");
+    freeGpuMetadata(gpuMemObjHost.peerSignalPtrs, "peerSignalPtrs");
+    freeGpuMetadata(gpuMemObjHost.deviceHandles_d, "deviceHandles_d");
+  }
+
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.peerPtrs, "peerPtrs");
+    freeGpuMetadata(gpuMemObjHost.p2pPeerPtrs, "p2pPeerPtrs");
+    freeGpuMetadata(gpuMemObjHost.peerRkeys, "peerRkeys");
+  }
+  freeGpuMetadata(memObjPtr.gpu, "SymmMemObj");
 
   memObjPool.erase(localPtr);
 }
@@ -303,7 +455,6 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
     std::vector<int> dstDeviceIds;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      if (i == rank) continue;
       dstDeviceIds.push_back(i % 8);  // should be intra devices count
     }
 
@@ -312,6 +463,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
       gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
       gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
       gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+      gpuMemObj->peerSignalPtrs = heapObj->gpu->peerSignalPtrs;
     }
   }
 
@@ -405,8 +557,7 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);  // hipMemAllocationTypeUncached
   } else {
     allocProp.type = hipMemAllocationTypePinned;
@@ -536,11 +687,12 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   SymmMemObj* cpuHeapObj = new SymmMemObj();
   cpuHeapObj->localPtr = vmmVirtualBasePtr;
   cpuHeapObj->size = virtualSize;
+  cpuHeapObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&vmmVirtualBasePtr, cpuHeapObj->peerPtrs, sizeof(uintptr_t));
-  
+
   // Setup P2P peer pointers (vmmPeerBasePtrs) and update peerPtrs for non-RDMA transports
   cpuHeapObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   for (int pe = 0; pe < worldSize; ++pe) {
@@ -891,8 +1043,7 @@ hipMemAllocationProp SymmMemManager::ConfigureAllocationProp(HeapType heapType, 
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);
   } else {
     allocProp.type = hipMemAllocationTypePinned;
@@ -1580,6 +1731,7 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Calculate peer pointers based on VMM per-PE virtual address spaces
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));

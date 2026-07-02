@@ -23,6 +23,10 @@ from mori import cpp as mori_cpp
 import torch
 import ctypes
 
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.restype = ctypes.py_object
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
 TORCH_DEVICE_TYPE_MAP = {
     "cpu": mori_cpp.MemoryLocationType.CPU,
     "cuda": mori_cpp.MemoryLocationType.GPU,
@@ -93,7 +97,19 @@ class IOEngine:
                 config = mori_cpp.XgmiBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
-        return self._engine.CreateBackend(type, config)
+        result = self._engine.CreateBackend(type, config)
+        if type is mori_cpp.BackendType.XGMI:
+            self._load_scatter_gather_kernel()
+        return result
+
+    def _load_scatter_gather_kernel(self):
+        try:
+            from mori.io.scatter_gather_jit import ensure_scatter_gather_kernel
+
+            hsaco_path = ensure_scatter_gather_kernel()
+            self._engine.LoadScatterGatherModule(hsaco_path)
+        except Exception:
+            pass
 
     def remove_backend(self, type: mori_cpp.BackendType):
         return self._engine.RemoveBackend(type)
@@ -107,7 +123,7 @@ class IOEngine:
     def register_memory(
         self, ptr: int, size: int, device_id: int, mem_loc: mori_cpp.MemoryLocationType
     ):
-        data = ctypes.pythonapi.PyCapsule_New(ctypes.c_void_p(ptr), None, None)
+        data = _PyCapsule_New(ctypes.c_void_p(ptr), None, None)
         return self._engine.RegisterMemory(data, size, device_id, mem_loc)
 
     def register_torch_tensor(self, tensor: torch.Tensor):
@@ -197,3 +213,6 @@ class IOEngine:
         if found:
             return transfer_status
         return None
+
+    def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
+        return self._engine.WaitAll(statuses, timeout_ms)

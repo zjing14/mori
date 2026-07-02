@@ -1,0 +1,17 @@
+recursive-include include *.hpp *.h
+recursive-include src *.cpp *.hpp *.h *.hip
+graft 3rdparty/spdlog
+graft 3rdparty/msgpack-c
+prune 3rdparty/spdlog/.git
+prune 3rdparty/msgpack-c/.git
+include CMakeLists.txt
+recursive-include src CMakeLists.txt
+include tools/build_shmem_bitcode.sh
+include tools/env_check.sh
+include tools/env_setup.sh
+include tools/diagnose_env.sh
+recursive-include python *.py *.md *.bc *.json *.sh
+include pyproject.toml
+include setup.py
+include LICENSE
+include README.md

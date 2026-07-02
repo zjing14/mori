@@ -24,6 +24,10 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>  // int64_t / uint8_t
+
+#include "mori/core/profiler/constants.hpp"  // MAX_TRACE_EVENTS_PER_WARP, ...
+
 #ifdef ENABLE_PROFILER
 #define IF_ENABLE_PROFILER(x) x
 #else
@@ -36,6 +40,13 @@ namespace core {
 namespace profiler {
 
 #ifdef ENABLE_PROFILER
+
+// wall_clock64() is a HIP device intrinsic only declared during device-code
+// compilation. Clang still parses __device__ function bodies in the host pass,
+// so provide a never-called host stub to satisfy the parser.
+#ifndef __HIP_DEVICE_COMPILE__
+__host__ static inline int64_t wall_clock64() { return 0; }
+#endif
 
 enum class EventType : uint8_t { BEGIN = 0, END = 1, INSTANT = 2 };
 

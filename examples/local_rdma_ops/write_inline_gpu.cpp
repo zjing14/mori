@@ -22,8 +22,8 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/application/application.hpp"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;
@@ -53,11 +53,19 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
     RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
     __threadfence_system();
 
-    int opcode =
-        PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
+    // PSD 4-arg PollCq is non-blocking (returns -1 when CQE / CCQE msg_msn not
+    // ready yet), while BNXT/MLX5 internally spin.  Wrap in a busy-wait loop so
+    // this example works uniformly across all providers.
+    uint32_t wqeIdx = 0;
+    int opcode;
+    do {
+      opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
+                         &wqeIdx);
+    } while (opcode < 0);
+    epSend.cqHandle.consIdx += 1;
     __threadfence_system();
     UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
-    // printf("round %d snd_opcode %d\n", i, opcode);
+    // printf("round %d snd_opcode %d wqeIdx %u\n", i, opcode, wqeIdx);
 
     raddr += i;
   }
@@ -89,16 +97,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         SendThreadKernel<ProviderType::MLX5>(epSend, mrRecv);
         break;
-#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrRecv);
         break;
-#endif
-#ifdef ENABLE_IONIC
       case ProviderType::PSD:
         SendThreadKernel<ProviderType::PSD>(epSend, mrRecv);
         break;
-#endif
       default:
         // unsupported provider
         break;

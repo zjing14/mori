@@ -28,13 +28,14 @@
 
 #include <cassert>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <queue>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <iostream>
 
 extern "C" {
 #include <pci/pci.h>
@@ -264,7 +265,10 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
     return TopoNodePci::CreateBridge(bus, numa);
   } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
     return TopoNodePci::CreateNet(bus, numa);
-  } else if (cls == 0x1200) {
+  } else if (cls == 0x1200 || cls == 0x0300 || cls == 0x0302) {
+    // 0x1200: Processing Accelerator (data-center GPUs)
+    // 0x0300: VGA compatible controller (RDNA 4 consumer/workstation GPUs, e.g. R9700)
+    // 0x0302: 3D controller (some workstation GPUs)
     return TopoNodePci::CreateGpu(bus, numa);
   }
 
@@ -296,13 +300,17 @@ void TopoSystemPci::Load() {
     pcis.emplace(node->BusId().packed, node);
 
     if (headerType == PCI_HEADER_TYPE_BRIDGE) {
-      uint8_t secondary = pci_read_byte(dev, PCI_SECONDARY_BUS);
-      uint8_t subordinate = pci_read_byte(dev, PCI_SUBORDINATE_BUS);
-      for (uint8_t i = secondary; i <= subordinate; i++) {
+      // Use a wider counter than the bus numbers themselves: a bridge may report
+      // a subordinate bus of 0xff (e.g. empty downstream ports on some NICs), and
+      // a uint8_t loop variable would wrap from 0xff back to 0 and spin forever.
+      uint32_t secondary = pci_read_byte(dev, PCI_SECONDARY_BUS);
+      uint32_t subordinate = pci_read_byte(dev, PCI_SUBORDINATE_BUS);
+      for (uint32_t i = secondary; i <= subordinate; i++) {
         uint64_t dspBusId = PciBusId(dev->domain, i, 0, 0).packed;
         if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
           struct pci_dev* lastDev = dsp2dev[dspBusId];
-          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS)) continue;
+          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS))
+            continue;
         }
         dsp2dev[dspBusId] = dev;
         assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));

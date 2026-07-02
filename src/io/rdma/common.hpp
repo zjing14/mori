@@ -21,11 +21,19 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
+#include "src/io/call_diagnostics_internal.hpp"
 
 namespace mori {
 namespace io {
@@ -36,12 +44,13 @@ namespace io {
 struct TopoKey {
   int deviceId;
   MemoryLocationType loc;
+  int numaNode{-1};
 
   bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
+    return (deviceId == rhs.deviceId) && (loc == rhs.loc) && (numaNode == rhs.numaNode);
   }
 
-  MSGPACK_DEFINE(deviceId, loc);
+  MSGPACK_DEFINE(deviceId, loc, numaNode);
 };
 
 struct TopoKeyPair {
@@ -73,7 +82,9 @@ struct hash<mori::io::TopoKey> {
   std::size_t operator()(const mori::io::TopoKey& k) const noexcept {
     std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
     std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    std::size_t h3 = std::hash<int>{}(k.numaNode);
+    std::size_t seed = h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    return seed ^ (h3 + 0x9e3779b9 + (seed << 6) + (seed >> 2));
   }
 };
 
@@ -100,6 +111,110 @@ struct hash<mori::io::MemoryKey> {
 namespace mori {
 namespace io {
 
+struct NotifMessage {
+  TransferUniqueId id{0};
+  int qpIndex{-1};
+  int totalNum{-1};
+};
+
+// wr_id namespace:
+//   Zone A: notification RECV indices [0, notifPerQp)
+//   Zone B: ledger record IDs [notifPerQp, 2^63)
+//   Zone C: notification SEND IDs tagged with bit 63
+static constexpr uint64_t kNotifSendWrIdTag = uint64_t{1} << 63;
+
+inline bool IsNotifSendWrId(uint64_t wr_id) { return (wr_id & kNotifSendWrIdTag) != 0; }
+
+inline TransferUniqueId ExtractTransferIdFromWrId(uint64_t wr_id) {
+  return static_cast<TransferUniqueId>(wr_id & ~kNotifSendWrIdTag);
+}
+
+uint64_t MakeNotifSendWrId(TransferUniqueId id);
+
+std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
+                                                      int maxChunks);
+
+struct ChunkedSgeSegment {
+  uint64_t remoteOffset{0};
+  uint64_t localAddr{0};
+  uint32_t length{0};
+};
+
+struct ChunkGeometry {
+  uint64_t finalCount{0};
+  uint64_t targetChunkBytes{0};
+};
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize);
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize);
+
+void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
+                         uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                         uint64_t maxMessageSize);
+
+struct CqCallbackMeta {
+  CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
+      : status(s), id(id_), totalBatchSize(n) {}
+
+  TransferStatus* status{nullptr};
+  TransferUniqueId id{0};
+  int totalBatchSize{0};
+  std::atomic<uint32_t> finishedBatchSize{0};
+  internal::IoCallDiagnostics diagnostics{};
+};
+
+// SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
+enum class SubmissionState : uint8_t {
+  Posted,    // submitted, awaiting CQE
+  Orphaned,  // partial post without signaled tail; awaits recovery
+};
+
+struct SubmissionRecord {
+  uint64_t recordId{0};
+  int postedWr{0};
+  bool hasSignaledTail{false};
+  SubmissionState state{SubmissionState::Posted};
+  std::shared_ptr<CqCallbackMeta> meta;
+  int batchSize{0};
+};
+
+class SubmissionLedger {
+ public:
+  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
+
+  // Allocate recordId, insert Posted record, return recordId.
+  uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
+                  int batchSize);
+
+  // Insert an Orphaned record (partial post, no signaled tail).
+  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+
+  // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
+  // Returns nullptr if record not found.
+  std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
+                                               int* outBatchSize);
+
+  // Recovery path: release only Orphaned records and keep Posted records.
+  int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
+
+  bool HasOrphaned() const;
+
+ private:
+  mutable std::mutex mu_;
+  uint64_t nextId_;
+  std::unordered_map<uint64_t, SubmissionRecord> records_;
+};
+
+inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
+
+struct SqAdmissionEvent {
+  alignas(4) std::atomic<uint32_t> epoch{0};
+  std::atomic<uint32_t> waiters{0};
+};
+
 struct EpPair {
   int weight;
   int ldevId;
@@ -107,6 +222,24 @@ struct EpPair {
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
+  // Shared across EpPair copies that refer to the same QP.
+  std::shared_ptr<std::atomic<int>> sqDepth;
+  int maxSqDepth{0};
+  // Degraded flag — set on partial post without signaled tail.
+  std::shared_ptr<std::atomic<bool>> degraded;
+  std::shared_ptr<SubmissionLedger> ledger;
+  // Shared across EpPair copies that refer to the same QP.
+  std::shared_ptr<SqAdmissionEvent> sqAdmission;
+};
+
+using EndpointId = uint64_t;
+
+struct EndpointRuntime {
+  EndpointRuntime() = default;
+  EndpointRuntime(EndpointId id_, const EpPair& ep_) : id(id_), ep(ep_) {}
+
+  EndpointId id{0};
+  EpPair ep;
 };
 
 using EpPairVec = std::vector<EpPair>;
@@ -119,28 +252,6 @@ struct RemoteEngineMeta {
   MemoryTable mTable;
 };
 
-struct NotifMessage {
-  TransferUniqueId id{0};
-  int qpIndex{-1};
-  int totalNum{-1};
-};
-
-struct CqCallbackMeta {
-  CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
-      : status(s), id(id_), totalBatchSize(n) {}
-
-  TransferStatus* status{nullptr};
-  TransferUniqueId id{0};
-  int totalBatchSize{0};
-  std::atomic<uint32_t> finishedBatchSize{0};
-};
-
-struct CqCallbackMessage {
-  CqCallbackMessage(CqCallbackMeta* m, int n) : meta(m), batchSize(n) {}
-  CqCallbackMeta* meta{nullptr};
-  int batchSize{0};
-};
-
 struct RdmaOpRet {
   StatusCode code{StatusCode::INIT};
   std::string message;
@@ -151,20 +262,54 @@ struct RdmaOpRet {
   bool Failed() { return code > StatusCode::ERR_BEGIN; }
 };
 
+void NotifySqStateChanged(const EpPair& ep);
+
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+namespace detail {
+
+// Test hook for SQ admission without proceeding to ibv_post_send on a fake QP.
+bool TryReserveSqDepthForTesting(const EpPair& ep, int wrCount, std::string* errMsg = nullptr);
+
+}  // namespace detail
+
+struct RdmaTransferControl {
+  size_t chunkBytes{0};
+  int maxChunks{1};
+  bool creditByWrCount{false};
+  bool ownsTotalBatchSize{true};
+  bool disableMerge{false};
+};
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control);
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize = -1,
+                             size_t chunkBytes = 0, int maxChunks = 1,
+                             bool creditByWrCount = false);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
-                             int postBatchSize = -1);
+                             std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                             bool isRead, int postBatchSize = -1);
 
 inline RdmaOpRet RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                                const SizeVec& localOffsets,
                                const application::RdmaMemoryRegion& remote,
                                const SizeVec& remoteOffsets, const SizeVec& sizes,
-                               CqCallbackMeta* callbackMeta, TransferUniqueId id,
+                               std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
                                int postBatchSize = -1) {
   return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, true /*isRead */, postBatchSize);
@@ -174,7 +319,7 @@ inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMem
                                 const SizeVec& localOffsets,
                                 const application::RdmaMemoryRegion& remote,
                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
-                                CqCallbackMeta* callbackMeta, TransferUniqueId id,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
                                 int postBatchSize = -1) {
   return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, false /*isRead */, postBatchSize);
@@ -182,23 +327,24 @@ inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMem
 
 inline RdmaOpRet RdmaReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                                size_t localOffset, const application::RdmaMemoryRegion& remote,
-                               size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                               TransferUniqueId id, bool isRead) {
+                               size_t remoteOffset, size_t size,
+                               std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                               bool isRead) {
   return RdmaBatchReadWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackMeta,
                             id, isRead, 1);
 }
 
 inline RdmaOpRet RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                           size_t localOffset, const application::RdmaMemoryRegion& remote,
-                          size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                          TransferUniqueId id) {
+                          size_t remoteOffset, size_t size,
+                          std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
   return RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, true);
 }
 
 inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                            size_t localOffset, const application::RdmaMemoryRegion& remote,
-                           size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                           TransferUniqueId id) {
+                           size_t remoteOffset, size_t size,
+                           std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
   return RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id,
                        false);
 }

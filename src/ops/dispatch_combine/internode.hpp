@@ -47,7 +47,7 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -73,7 +73,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   int numExpertPerToken = config.numExpertPerToken;
   assert(numExpertPerToken < warpSize);
 
-  size_t weightOffset = config.hiddenDim * sizeof(T);
+  size_t weightOffset = config.HiddenDimSz() * sizeof(T);
   size_t indicesOffset = weightOffset + sizeof(float) * numExpertPerToken;
   size_t scalesOffset = indicesOffset + sizeof(index_t) * numExpertPerToken;
   size_t stagingOffset = scalesOffset + config.scaleTypeSize * config.scaleDim;
@@ -103,7 +103,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
             dupMask & (((1ULL << laneInSubWarp) - 1ULL) << (subWarpId * numExpertPerToken));
         dup = (lowerMask != 0ULL);
       }
-      if (dup) {
+      // Out-of-range expert id guard: destPe indexes destPeTokenCounter and
+      // destPeTokenIdxMap below; an out-of-range id (e.g. an EPLB physical id
+      // >= worldSize*numExpertPerRank) would index them out of bounds -> HSA
+      // page fault. Fold it into the dedup skip (the __match_any_sync above has
+      // already run for all lanes, so this per-lane skip stays coherent).
+      bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+      if (dup || peOutOfRange) {
         args.dispSenderIdxMap[expertOffset] = MaxNumTokensToRecv;
         continue;
       } else {
@@ -153,34 +159,34 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
       size_t mapIdxOffset = mapIdx * stagingOffset;
       const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
-      size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
+      size_t tokenOffset = tokenId * config.HiddenDimSz() * sizeof(T);
       const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
       size_t peSortedOffset = peSortedId * stagingOffset;
-      core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+      core::WarpCopy(args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset,
                      reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
-                     config.hiddenDim * sizeof(T));
+                     config.HiddenDimSz() * sizeof(T));
       if (args.weightsBuf) {
         core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+            args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + weightOffset,
             reinterpret_cast<char*>(args.weightsBuf) +
                 tokenId * config.numExpertPerToken * sizeof(float),
             config.numExpertPerToken * sizeof(float));
       }
       core::WarpCopy(
-          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
+          args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + indicesOffset,
           reinterpret_cast<char*>(args.tokenIndices) +
               tokenId * config.numExpertPerToken * sizeof(index_t),
           config.numExpertPerToken * sizeof(index_t));
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
+            args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + scalesOffset,
             reinterpret_cast<char*>(args.scalesBuf) +
                 tokenId * config.scaleDim * config.scaleTypeSize,
             config.scaleDim * config.scaleTypeSize);
       }
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemDispatchInpTokMemObj, peSortedOffset,
-                                          args.shmemStagingTokMemObj, mapIdxOffset, stagingOffset,
-                                          destPe, localBlockId);
+      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.interNodeTokBufs.dispatchInp, peSortedOffset,
+                                          args.interNodeTokBufs.staging, mapIdxOffset,
+                                          stagingOffset, destPe, localBlockId);
     }
   } else {
     // inter node use ibgda for transfer
@@ -209,8 +215,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t srcOffset = srcIdx * stagingOffset;
         const index_t dstIdx = myPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
         size_t dstOffset = dstIdx * stagingOffset;
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemDispatchInpTokMemObj, dstOffset,
-                                            args.shmemStagingTokMemObj, srcOffset,
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.interNodeTokBufs.dispatchInp, dstOffset,
+                                            args.interNodeTokBufs.staging, srcOffset,
                                             actualTokenNum * stagingOffset, destPe, localBlockId);
 
         ++chunkIdx;
@@ -223,27 +229,27 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         size_t mapIdxOffset = mapIdx * stagingOffset;
         const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
-        size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
+        size_t tokenOffset = tokenId * config.HiddenDimSz() * sizeof(T);
         // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
-        // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
-        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+        // size_t peSortedOffset = peSortedId * config.HiddenDimSz();
+        core::WarpCopy(args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset,
                        reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
-                       config.hiddenDim * sizeof(T));
+                       config.HiddenDimSz() * sizeof(T));
         if (args.weightsBuf) {
           core::WarpCopy(
-              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+              args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + weightOffset,
               reinterpret_cast<char*>(args.weightsBuf) +
                   tokenId * config.numExpertPerToken * sizeof(float),
               config.numExpertPerToken * sizeof(float));
         }
         core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
+            args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + indicesOffset,
             reinterpret_cast<char*>(args.tokenIndices) +
                 tokenId * config.numExpertPerToken * sizeof(index_t),
             config.numExpertPerToken * sizeof(index_t));
         if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
           core::WarpCopy(
-              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
+              args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + scalesOffset,
               reinterpret_cast<char*>(args.scalesBuf) +
                   tokenId * config.scaleDim * config.scaleTypeSize,
               config.scaleDim * config.scaleTypeSize);
@@ -294,27 +300,27 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     localTokenIdx = __shfl(localTokenIdx, 0);
     index_t peSortedId = destPe * MaxNumTokensToRecvPerRank + startRecvIdx + idx;
 
-    size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim) * sizeof(T);
+    size_t localTokenOffset = size_t(localTokenIdx) * config.HiddenDimSz() * sizeof(T);
     size_t peSortedTokenOffset = size_t(peSortedId) * stagingOffset;
 
-    core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<char*>() + localTokenOffset,
-                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
-                   config.hiddenDim * sizeof(T));
+    core::WarpCopy(args.interNodeTokBufs.dispatchOut->template GetAs<char*>() + localTokenOffset,
+                   args.interNodeTokBufs.dispatchInp->template GetAs<char*>() + peSortedTokenOffset,
+                   config.HiddenDimSz() * sizeof(T));
     core::WarpCopy(args.shmemDispatchOutWeightsMemObj->template GetAs<char*>() +
                        localTokenIdx * config.numExpertPerToken * sizeof(float),
-                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
-                       weightOffset,
+                   args.interNodeTokBufs.dispatchInp->template GetAs<char*>() +
+                       peSortedTokenOffset + weightOffset,
                    config.numExpertPerToken * sizeof(float));
     core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<char*>() +
                        localTokenIdx * config.numExpertPerToken * sizeof(index_t),
-                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
-                       indicesOffset,
+                   args.interNodeTokBufs.dispatchInp->template GetAs<char*>() +
+                       peSortedTokenOffset + indicesOffset,
                    config.numExpertPerToken * sizeof(index_t));
     if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
       core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<char*>() +
                          localTokenIdx * config.scaleDim * config.scaleTypeSize,
-                     args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
-                         scalesOffset,
+                     args.interNodeTokBufs.dispatchInp->template GetAs<char*>() +
+                         peSortedTokenOffset + scalesOffset,
                      config.scaleDim * config.scaleTypeSize);
     }
     if (laneId == 0) {
@@ -363,11 +369,16 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
   __syncthreads();
 }
+template <typename T>
+__global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeKernel_body<T>(args);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineInterNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
@@ -407,7 +418,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int startIdx = localBlockId * baseChunk + min(localBlockId, remainder);
   const int endIdx = startIdx + myChunkSize;
 
-  const size_t tokenSize = config.hiddenDim * sizeof(T);
+  const size_t tokenSize = config.HiddenDimSz() * sizeof(T);
   const size_t weightSize = args.weightsBuf ? config.numExpertPerToken * sizeof(float) : 0;
   const size_t tokenPackSize = tokenSize + weightSize;
 
@@ -420,20 +431,20 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
       size_t tokenOffset = tokenId * tokenSize;
       const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
       size_t peSortedOffset = peSortedId * tokenPackSize;
-      core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+      core::WarpCopy(args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset,
                      reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset, tokenSize);
 
       if (args.weightsBuf) {
         core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + tokenSize,
+            args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + tokenSize,
             reinterpret_cast<char*>(args.weightsBuf) +
                 tokenId * config.numExpertPerToken * sizeof(float),
             weightSize);
       }
 
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemCombineInpTokMemObj, peSortedOffset,
-                                          args.shmemStagingTokMemObj, mapIdxOffset, tokenPackSize,
-                                          srcPe);
+      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.interNodeTokBufs.combineInp, peSortedOffset,
+                                          args.interNodeTokBufs.staging, mapIdxOffset,
+                                          tokenPackSize, srcPe);
     }
   } else {
     // inter node use ibgda for transfer
@@ -462,8 +473,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t srcOffset = srcIdx * tokenPackSize;
         const index_t dstIdx = myPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
         size_t dstOffset = dstIdx * tokenPackSize;
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemCombineInpTokMemObj, dstOffset,
-                                            args.shmemStagingTokMemObj, srcOffset,
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.interNodeTokBufs.combineInp, dstOffset,
+                                            args.interNodeTokBufs.staging, srcOffset,
                                             actualTokenNum * tokenPackSize, srcPe, localBlockId);
 
         ++chunkIdx;
@@ -479,12 +490,12 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t tokenOffset = tokenId * tokenSize;
         // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
-        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+        core::WarpCopy(args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset,
                        reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset, tokenSize);
 
         if (args.weightsBuf) {
           core::WarpCopy(
-              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + tokenSize,
+              args.interNodeTokBufs.staging->template GetAs<char*>() + mapIdxOffset + tokenSize,
               reinterpret_cast<char*>(args.weightsBuf) +
                   tokenId * config.numExpertPerToken * sizeof(float),
               weightSize);
@@ -526,14 +537,12 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
-  int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  size_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, config.HiddenDimSz());
 
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    int tokenId = i / warpsPerToken;
-    int inTokenPartId = i % warpsPerToken;
-    size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    size_t hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
+  for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
+    int tokenId, inTokenPartId;
+    size_t hiddenDimOffset, hiddenDimSize;
+    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
@@ -543,21 +552,21 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
       size_t weightByteOffset = size_t(peSortedId) * tokenPackSize + tokenSize;
 
       if (destPe < config.worldSize) {
-        srcPtrs[j] = reinterpret_cast<T*>(args.shmemCombineInpTokMemObj->template GetAs<char*>() +
-                                          byteOffset);
+        srcPtrs[j] = reinterpret_cast<T*>(
+            args.interNodeTokBufs.combineInp->template GetAs<char*>() + byteOffset);
         srcWeightsPtr[j] = reinterpret_cast<float*>(
-            args.shmemCombineInpTokMemObj->template GetAs<char*>() + weightByteOffset);
+            args.interNodeTokBufs.combineInp->template GetAs<char*>() + weightByteOffset);
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
       }
     }
 
-    size_t offset = size_t(tokenId) * size_t(config.hiddenDim) + hiddenDimOffset;
-    core::WarpAccum<T, 8>(args.shmemCombineOutTokMemObj->template GetAs<T*>() + offset, srcPtrs,
+    size_t offset = size_t(tokenId) * config.HiddenDimSz() + hiddenDimOffset;
+    core::WarpAccum<T, 8>(args.interNodeTokBufs.combineOut->template GetAs<T*>() + offset, srcPtrs,
                           nullptr, config.numExpertPerToken, hiddenDimSize);
 
-    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+    if (args.weightsBuf && inTokenPartId == mwIter.warpsPerItem - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
                                 srcWeightsPtr, nullptr, config.numExpertPerToken,
@@ -568,6 +577,11 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
   }
+}
+
+template <typename T>
+__global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeKernel_body<T>(args);
 }
 
 }  // namespace moe

@@ -27,4 +27,13 @@ namespace mori {
 void RegisterMoriOps(pybind11::module_& m);
 void RegisterMoriShmem(pybind11::module_& m);
 void RegisterMoriIo(pybind11::module_& m);
+#ifdef MORI_BUILD_COLLECTIVE
+void RegisterMoriCcl(pybind11::module_& m);
+#endif
+#ifdef BUILD_XLA_FFI_OPS
+void RegisterXLAFFIOps(pybind11::module_& m);
+#endif
+#ifdef MORI_BUILD_UMBP
+void RegisterMoriUmbp(pybind11::module_& m);
+#endif
 }  // namespace mori

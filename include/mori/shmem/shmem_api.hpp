@@ -21,14 +21,30 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef MORI_WITH_MPI
 #include <mpi.h>
+#endif
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
+// Host/device split. Device and mixed-hipcc TUs only need the device-safe
+// application types (plus a forward decl of the host-only BootstrapNetwork, used by
+// pointer in ShmemInit below); the full application.hpp would drag the host RDMA
+// stack -> the system verbs.h/mlx5dv.h into the device compile. Host TUs keep
+// application.hpp for the host includes they have historically gotten transitively.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/application/application_device_types.hpp"
+namespace mori {
+namespace application {
+class BootstrapNetwork;  // host-only; defined in application/bootstrap/base_bootstrap.hpp
+}  // namespace application
+}  // namespace mori
+#else
 #include "mori/application/application.hpp"
+#endif
 
 namespace mori {
 namespace shmem {
@@ -52,9 +68,10 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#ifdef MORI_WITH_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
-int ShmemTorchProcessGroupInit(const std::string& groupName);
+#endif
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
 int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);
@@ -62,9 +79,18 @@ int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
                              mori_shmem_init_attr_t* attr);
 int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 
+bool ShmemIsInitialized();
 int ShmemFinalize();
 
 int ShmemModuleInit(void* hipModule);
+int LoadShmemModule(const char* hsaco_path);
+int CopyGpuStatesToSymbol(void* deviceSymbolAddr);
+
+using GpuStatesAddrProvider = void* (*)();
+void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider);
+
+using BarrierLauncher = void (*)(hipStream_t);
+void RegisterBarrierLauncher(BarrierLauncher launcher);
 
 int ShmemMyPe();
 int ShmemNPes();
@@ -80,6 +106,11 @@ enum ShmemTeamType {
 };
 
 int ShmemNumQpPerPe();
+
+// Returns the MORI_ENABLE_SDMA snapshot taken at Context construction time.
+// Use this instead of getenv("MORI_ENABLE_SDMA") so callers stay consistent
+// with the transport selection that was made at shmem init.
+bool ShmemSdmaEnabled();
 
 // TODO: finish team pe api
 // int ShmemTeamMyPe(ShmemTeamType);
@@ -99,6 +130,10 @@ application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);
+
+// Keep symmetric register APIs used by SDMA collective paths.
+application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size);
+int ShmemSymmetricDeregister(void* ptr, size_t size);
 
 uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe);
 

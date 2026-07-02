@@ -21,27 +21,20 @@
 // SOFTWARE.
 #pragma once
 
-#ifdef ENABLE_BNXT
+#include "mori/application/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 extern "C" {
-#include <infiniband/bnxt_re_dv.h>
-#include <infiniband/bnxt_re_hsi.h>
-}  // ENABLE_BNXT
-#else
-extern "C" {
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
-#endif
-
-#include "mori/application/transport/rdma/rdma.hpp"
 
 #include <mutex>
 #include <set>
 
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
+#include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
+
 namespace mori {
 namespace application {
-
-#ifdef ENABLE_BNXT
 // BNXT UDP sport configuration constants
 static constexpr uint32_t BNXT_UDP_SPORT_ARRAY_SIZE = 4;
 
@@ -63,7 +56,8 @@ class BnxtDeviceContext;  // Forward declaration
 
 class BnxtCqContainer {
  public:
-  BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config, BnxtDeviceContext* device_context);
+  BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config,
+                  BnxtDeviceContext* device_context);
   ~BnxtCqContainer();
 
  public:
@@ -154,7 +148,7 @@ class BnxtDeviceContext : public RdmaDeviceContext {
 
   std::unordered_map<uint32_t, BnxtCqContainer*> cqPool;
   std::unordered_map<uint32_t, BnxtQpContainer*> qpPool;
-  
+
   // Track registered UAR addresses to avoid double registration/unregistration
   std::set<void*> registeredUars;
   std::mutex uarMutex;
@@ -167,6 +161,5 @@ class BnxtDevice : public RdmaDevice {
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
-#endif  // ENABLE_BNXT
 }  // namespace application
 }  // namespace mori

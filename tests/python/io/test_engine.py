@@ -23,7 +23,6 @@ import pytest
 import os
 import time
 from contextlib import contextmanager
-from tests.python.utils import get_free_port
 import torch
 from mori.io import (
     IOEngineConfig,
@@ -48,10 +47,9 @@ def create_connected_engine_pair(
 ):
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     initiator = IOEngine(key=f"{name_prefix}_initiator", config=config)
-    config.port = get_free_port()
     target = IOEngine(key=f"{name_prefix}_target", config=config)
 
     config = RdmaBackendConfig(
@@ -116,13 +114,14 @@ def pre_connected_engine_pair():
 def test_engine_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine", config=config)
     engine.create_backend(BackendType.RDMA)
 
     desc = engine.get_engine_desc()
     assert desc.node_id != ""
+    assert desc.pid > 0
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
@@ -140,6 +139,7 @@ def test_engine_desc_port_zero_auto_bind():
     desc = engine.get_engine_desc()
     assert desc.port > 0
     assert desc.node_id != ""
+    assert desc.pid > 0
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
@@ -147,21 +147,49 @@ def test_engine_desc_port_zero_auto_bind():
 
 
 def test_engine_desc_node_id_env_override(monkeypatch):
-    monkeypatch.setenv("MORI_IO_NODE_ID", "node-id-test")
+    monkeypatch.setenv("MORI_NODE_ID", "node-id-test")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine_node_id", config=config)
     desc = engine.get_engine_desc()
     assert desc.node_id == "node-id-test"
 
 
+def test_rdma_backend_config_chunking_fields():
+    default_config = RdmaBackendConfig()
+    assert default_config.chunk_bytes == 65536
+
+    config = RdmaBackendConfig(
+        qp_per_transfer=4,
+        post_batch_size=-1,
+        num_worker_threads=2,
+        enable_notification=True,
+        notif_per_qp=2048,
+        enable_transfer_chunking=True,
+        chunk_bytes=65536,
+        max_chunks_per_transfer=32,
+        num_nics_per_transfer=2,
+    )
+
+    assert config.qp_per_transfer == 4
+    assert config.post_batch_size == -1
+    assert config.num_worker_threads == 2
+    assert config.enable_notification is True
+    assert config.notif_per_qp == 2048
+    assert config.enable_transfer_chunking is True
+    assert config.chunk_bytes == 65536
+    assert config.max_chunks_per_transfer == 32
+    assert config.num_nics_per_transfer == 2
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
-def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem():
+def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem(monkeypatch):
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -178,7 +206,7 @@ def test_rdmabackend_auto_xgmi_can_be_disabled(monkeypatch):
     monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "1")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_disabled_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -191,10 +219,11 @@ def test_rdmabackend_auto_xgmi_can_be_disabled(monkeypatch):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
-def test_intra_node_prefers_xgmi_after_rdma_creation():
+def test_intra_node_prefers_xgmi_after_rdma_creation(monkeypatch):
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_route_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -217,7 +246,7 @@ def test_intra_node_prefers_xgmi_after_rdma_creation():
 def test_mem_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -228,9 +257,11 @@ def test_mem_desc():
 
     assert mem_desc.engine_key == "engine"
     assert mem_desc.device_id == -1
+    assert mem_desc.device_bus_id == ""
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.CPU
+    assert mem_desc.numa_node >= -1
 
     # Test gpu tensor
     device = torch.device("cuda", 0)
@@ -239,9 +270,11 @@ def test_mem_desc():
 
     assert mem_desc.engine_key == "engine"
     assert mem_desc.device_id == 0
+    assert mem_desc.device_bus_id != ""
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.GPU
+    assert mem_desc.numa_node == -1
 
     # TODO: test mem_desc pack / unpack
     packed_desc = mem_desc.pack()
@@ -261,6 +294,20 @@ def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
         )
         if target_side_status:
             return target_side_status
+
+
+def wait_inbound_status_with_timeout(
+    engine, remote_engine_key, remote_transfer_uid, timeout_s=2.0
+):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        target_side_status = engine.pop_inbound_transfer_status(
+            remote_engine_key, remote_transfer_uid
+        )
+        if target_side_status:
+            return target_side_status
+        time.sleep(0.001)
+    return None
 
 
 def alloc_and_register_mem(engine_pair, shape):
@@ -472,13 +519,114 @@ def test_notification_disabled():
     assert inbound_status is None  # No notification received
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_multithread_batch_error_path_is_recoverable():
+    """Regression for callback meta ownership on error paths.
+
+    Repeatedly trigger failing multithread batch calls, then verify a valid
+    transfer still completes end-to-end with notification.
+    """
+
+    initiator, target = create_connected_engine_pair(
+        "regress_cbmeta",
+        qp_per_transfer=2,
+        post_batch_size=-1,
+        num_worker_threads=2,
+        enable_notification=True,
+    )
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (2, 64)
+    )
+
+    bad_offsets = [0, 64]
+    bad_sizes = [64, 65]  # out-of-range for the second element
+
+    # Run multiple failures to stress repeated cleanup/release behavior.
+    for _ in range(20):
+        transfer_uid = initiator.allocate_transfer_uid()
+        status = initiator.batch_read(
+            [initiator_mem],
+            [bad_offsets],
+            [target_mem],
+            [bad_offsets],
+            [bad_sizes],
+            [transfer_uid],
+        )[0]
+        wait_status(status)
+        assert status.Failed()
+        assert status.Code() == StatusCode.ERR_INVALID_ARGS
+
+    # Verify subsequent valid transfer still works.
+    transfer_uid = initiator.allocate_transfer_uid()
+    full_size = initiator_tensor.numel() * initiator_tensor.element_size()
+    status = initiator.write(initiator_mem, 0, target_mem, 0, full_size, transfer_uid)
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+
+    inbound = wait_inbound_status_with_timeout(
+        target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+    )
+    assert (
+        inbound is not None
+    ), "Expected inbound notification after successful transfer"
+    assert inbound.Succeeded()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_successful_writes_always_have_inbound_notification_under_pressure():
+    """Regression for notify all-or-none behavior.
+
+    Under low SQ timeout and high-frequency writes, every successful write must
+    still produce a corresponding inbound completion notification.
+    """
+
+    with temporary_env("MORI_IO_SQ_BACKOFF_TIMEOUT_US", "100"):
+        initiator, target = create_connected_engine_pair(
+            "regress_notify",
+            qp_per_transfer=4,
+            post_batch_size=1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+
+        initiator_tensor, target_tensor, initiator_mem, target_mem = (
+            alloc_and_register_mem((initiator, target), (1, 128))
+        )
+
+        initiator_key = initiator.get_engine_desc().key
+
+        for i in range(50):
+            transfer_uid = initiator.allocate_transfer_uid()
+            status = initiator.write(initiator_mem, 0, target_mem, 0, 128, transfer_uid)
+            wait_status(status)
+
+            if status.Succeeded():
+                inbound = wait_inbound_status_with_timeout(
+                    target, initiator_key, transfer_uid, timeout_s=2.0
+                )
+                assert (
+                    inbound is not None
+                ), f"Missing inbound notification for successful transfer {i}"
+                assert inbound.Succeeded()
+            else:
+                # Failed transfers may legitimately miss notification; they
+                # should not poison future successful transfers.
+                assert status.Code() in (
+                    StatusCode.ERR_RDMA_OP,
+                    StatusCode.ERR_BAD_STATE,
+                )
+
+        assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
 def test_no_backend():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     initiator = IOEngine(key="no_be_initiator", config=config)
-    config.port = get_free_port()
     target = IOEngine(key="no_be_target", config=config)
 
     initiator_desc = initiator.get_engine_desc()
@@ -598,6 +746,23 @@ def test_xgmi_same_device(xgmi_engine):
     status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
     status.Wait()
     assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_status_completes_without_wait(xgmi_engine):
+    src_tensor, dst_tensor, src_mem, dst_mem = alloc_xgmi_mem(
+        xgmi_engine, src_gpu=0, dst_gpu=1, shape=(1024,)
+    )
+    transfer_uid = xgmi_engine.allocate_transfer_uid()
+    status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
+
+    deadline = time.time() + 5
+    while status.InProgress() and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert not status.InProgress(), "XGMI status should progress without calling Wait()"
+    assert status.Succeeded(), status.Message()
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
 

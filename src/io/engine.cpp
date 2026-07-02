@@ -21,16 +21,86 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+#include <cctype>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/utils/host_utils.hpp"
+#include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
 namespace io {
+
+namespace {
+
+template <typename... Args>
+inline void LogTransferFailure(const std::shared_ptr<internal::IoCallDiagnostics>& diagnostics,
+                               const char* fmt, Args&&... args) {
+  internal::IoFailureKind failureKind =
+      diagnostics ? diagnostics->CurrentFailureKind() : internal::IoFailureKind::None;
+  if (failureKind == internal::IoFailureKind::None) {
+    failureKind = internal::IoFailureKind::RootCause;
+  }
+  if (diagnostics && !diagnostics->TryMarkLogged(failureKind)) {
+    return;
+  }
+  if (failureKind == internal::IoFailureKind::FlushCascade) {
+    MORI_IO_DEBUG(fmt, std::forward<Args>(args)...);
+  } else {
+    MORI_IO_ERROR(fmt, std::forward<Args>(args)...);
+  }
+}
+
+std::string QueryDeviceBusId(int deviceId) {
+  if (deviceId < 0) {
+    return "";
+  }
+
+  char busId[32] = {0};
+  hipError_t err = hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("Failed to query PCI bus id for device {}: {}", deviceId, hipGetErrorString(err));
+    return "";
+  }
+  std::string result(busId);
+  for (auto& c : result) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return result;
+}
+
+bool IsAutoXgmiEnabled() {
+  const char* v = std::getenv("MORI_DISABLE_AUTO_XGMI");
+  return v != nullptr && v[0] == '0';
+}
+
+int DetectNumaNode(void* addr) {
+#if defined(SYS_get_mempolicy)
+  int node = -1;
+  long rc = syscall(SYS_get_mempolicy, &node, nullptr, 0,
+                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr)),
+                    MPOL_F_NODE | MPOL_F_ADDR);
+  return rc == 0 ? node : -1;
+#else
+  (void)addr;
+  return -1;
+#endif
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         IOEngineSession                                        */
@@ -42,18 +112,24 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session read");
   backendSess->Read(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session read error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(diagnostics, "Session read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session write");
   backendSess->Write(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session write error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(diagnostics, "Session write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
   return;
 }
@@ -61,10 +137,12 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch read");
   backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
-                  status->Message());
+    LogTransferFailure(diagnostics, "Session batch read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -72,10 +150,12 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
                                  const SizeVec& sizes, TransferStatus* status,
                                  TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch write");
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session batch write error {} message {}", status->CodeUint32(),
-                  status->Message());
+    LogTransferFailure(diagnostics, "Session batch write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -90,10 +170,11 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.key = key;
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
-  desc.nodeId = ResolveNodeId(hostname);
+  desc.nodeId = mori::ResolveNodeId(hostname);
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
+  desc.pid = static_cast<int>(getpid());
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
@@ -107,6 +188,42 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   }
 
   if (type == BackendType::RDMA) {
+    if (!RdmaBackend::HasActiveDevices()) {
+      if (!IsAutoXgmiEnabled()) {
+        throw std::runtime_error(
+            "no active RDMA device on this host; "
+            "set MORI_DISABLE_AUTO_XGMI=0 to enable XGMI-only fallback");
+      }
+
+      if (!SupportsXgmiBackendByP2P()) {
+        throw std::runtime_error(
+            "no active RDMA device and no usable GPU P2P; cannot create any backend");
+      }
+
+      desc.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+      this->config.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+
+      if (backends.find(BackendType::XGMI) != backends.end()) {
+        InvalidateRouteCache();
+        return;
+      }
+
+      MORI_IO_WARN("No active RDMA device; falling back to XGMI-only mode (port={})",
+                   internal::kXgmiOnlyFallbackPlaceholderPort);
+
+      XgmiBackendConfig xgmiConfig{};
+      auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+      backends.insert({BackendType::XGMI, std::move(backend)});
+      InvalidateRouteCache();
+      return;
+    }
+
+    if (config.port == internal::kXgmiOnlyFallbackPlaceholderPort) {
+      throw std::runtime_error(
+          "IOEngineConfig.port=" + std::to_string(internal::kXgmiOnlyFallbackPlaceholderPort) +
+          " is reserved as XGMI-only fallback sentinel");
+    }
+
     auto backend = std::make_unique<RdmaBackend>(desc.key, config,
                                                  static_cast<const RdmaBackendConfig&>(beConfig));
 
@@ -118,6 +235,10 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
         assert(false && "Failed to retrieve bound port after RDMA backend init");
       } else {
         uint16_t bound_port = bound_port_opt.value();
+        if (bound_port == internal::kXgmiOnlyFallbackPlaceholderPort) {
+          throw std::runtime_error("RDMA control-plane bound to sentinel port " +
+                                   std::to_string(bound_port));
+        }
         desc.port = bound_port;
         this->config.port = bound_port;
         MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
@@ -178,15 +299,15 @@ bool IOEngine::SupportsXgmiBackendByP2P() const {
 }
 
 void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
-  bool isAutoXgmiDisabled = false;
-  const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
-  if (disableAutoXgmi != nullptr) {
-    isAutoXgmiDisabled = disableAutoXgmi[0] != '\0' && disableAutoXgmi[0] != '0';
-    if (isAutoXgmiDisabled) {
+  if (!IsAutoXgmiEnabled()) {
+    const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
+    if (disableAutoXgmi != nullptr && disableAutoXgmi[0] != '\0' && disableAutoXgmi[0] != '0') {
       MORI_IO_INFO("Auto XGMI creation is disabled by MORI_DISABLE_AUTO_XGMI");
-      return;
     }
+    return;
   }
+
+  MORI_IO_INFO("Auto XGMI creation is enabled by MORI_DISABLE_AUTO_XGMI=0");
 
   if (backends.find(BackendType::XGMI) != backends.end()) {
     return;
@@ -236,9 +357,15 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
+  if (loc == MemoryLocationType::GPU) {
+    memDesc.deviceBusId = QueryDeviceBusId(device);
+  }
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
+  if (loc == MemoryLocationType::CPU && data != nullptr) {
+    memDesc.numaNode = DetectNumaNode(data);
+  }
 
   for (auto& it : backends) {
     it.second->RegisterMemory(memDesc);
@@ -273,11 +400,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
 
   if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
     auto cachedBackend = backends.find(cachedType.value());
-    if (cachedBackend != backends.end()) {
-      if (cachedType.value() != BackendType::XGMI ||
-          cachedBackend->second->CanHandle(local, remote)) {
-        return cachedBackend->second.get();
-      }
+    if (cachedBackend != backends.end() && cachedBackend->second->CanHandle(local, remote)) {
+      return cachedBackend->second.get();
     }
   }
 
@@ -290,14 +414,13 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   }
 
   auto rdmaIt = backends.find(BackendType::RDMA);
-  if (rdmaIt != backends.end()) {
+  if (rdmaIt != backends.end() && rdmaIt->second->CanHandle(local, remote)) {
     UpdateRouteCache(routeKey, BackendType::RDMA);
     return rdmaIt->second.get();
   }
 
-  BackendType fallbackType = backends.begin()->first;
-  UpdateRouteCache(routeKey, fallbackType);
-  return backends.begin()->second.get();
+  // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
+  return nullptr;
 }
 
 void IOEngine::InvalidateRouteCache() {
@@ -319,14 +442,6 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
   return it->second;
 }
 
-std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
-  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
-  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
-    return std::string(nodeIdEnv);
-  }
-  return hostname;
-}
-
 #define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
   backend = SelectBackend(local, remote);                                     \
   if (backend == nullptr) {                                                   \
@@ -341,11 +456,14 @@ std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine read");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
   backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Engine read error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(diagnostics, "Engine read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -353,11 +471,14 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine write");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
   backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Engine write error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(diagnostics, "Engine write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -375,13 +496,15 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+    internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch read");
     Backend* backend = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
-      MORI_IO_ERROR("Engine batch read error {} message {}", status[i]->CodeUint32(),
-                    status[i]->Message());
+      LogTransferFailure(diagnostics, "Engine batch read error {} message {}",
+                         status[i]->CodeUint32(), status[i]->Message());
     }
   }
 }
@@ -400,13 +523,15 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+    internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch write");
     Backend* backend = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
     if (status[i]->Failed()) {
-      MORI_IO_ERROR("Engine batch write error {} message {}", status[i]->CodeUint32(),
-                    status[i]->Message());
+      LogTransferFailure(diagnostics, "Engine batch write error {} message {}",
+                         status[i]->CodeUint32(), status[i]->Message());
     }
   }
 }
@@ -421,8 +546,18 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
     return std::nullopt;
   }
   sess.backendSess.reset(backend->CreateSession(local, remote));
+  if (sess.backendSess == nullptr) {
+    return std::nullopt;
+  }
 
   return sess;
+}
+
+void IOEngine::LoadScatterGatherModule(const std::string& hsacoPath) {
+  auto it = backends.find(BackendType::XGMI);
+  if (it != backends.end()) {
+    static_cast<XgmiBackend*>(it->second.get())->LoadScatterGatherModule(hsacoPath);
+  }
 }
 
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
@@ -433,6 +568,61 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
+}
+
+StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs) {
+  if (statuses.empty()) return StatusCode::SUCCESS;
+
+  if (timeoutMs == 0) {
+    bool anyInProgress = false;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(0);
+      if (rc == StatusCode::IN_PROGRESS) {
+        anyInProgress = true;
+        continue;
+      }
+      if (rc != StatusCode::SUCCESS) return rc;
+    }
+    return anyInProgress ? StatusCode::IN_PROGRESS : StatusCode::SUCCESS;
+  }
+
+  if (timeoutMs < 0) {
+    StatusCode firstError = StatusCode::SUCCESS;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(-1);
+      if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+        firstError = rc;
+      }
+    }
+    return firstError;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  StatusCode firstError = StatusCode::SUCCESS;
+  for (TransferStatus* status : statuses) {
+    if (status == nullptr) continue;
+
+    const auto now = Clock::now();
+    if (now >= deadline) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    const int remainingMs = remaining.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(remaining.count());
+    StatusCode rc = status->WaitFor(remainingMs);
+    if (rc == StatusCode::IN_PROGRESS) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+    if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+      firstError = rc;
+    }
+  }
+  return firstError;
 }
 
 }  // namespace io

@@ -21,10 +21,11 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -39,12 +40,14 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        XgmiBackendSession                                      */
 /* ---------------------------------------------------------------------------------------------- */
+class XgmiBackend;
+
 class XgmiBackendSession : public BackendSession {
  public:
   XgmiBackendSession() = default;
   XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr, void* remoteAddr,
-                     int localDevice, int remoteDevice, StreamPool* streamPool,
-                     EventPool* eventPool);
+                     int localDevice, int remoteDevice, bool isIpcSession, XgmiBackend* backend,
+                     StreamPool* streamPool, EventPool* eventPool);
   ~XgmiBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -62,6 +65,8 @@ class XgmiBackendSession : public BackendSession {
   void* remoteAddr{nullptr};
   int localDevice{-1};
   int remoteDevice{-1};
+  bool isIpcSession{false};
+  XgmiBackend* backend{nullptr};
   StreamPool* streamPool{nullptr};
   EventPool* eventPool{nullptr};
 };
@@ -92,9 +97,17 @@ class XgmiBackend : public Backend {
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   bool IsP2PAccessible(int srcDevice, int dstDevice) const;
+  void LoadScatterGatherModule(const std::string& hsacoPath);
+  hipFunction_t GetScatterGatherFunc(int deviceId);
 
  private:
   void InitializeP2PAccess();
+  std::optional<int> ResolveVisibleDeviceId(const MemoryDesc& desc) const;
+  std::optional<int> LookupVisibleDevice(const std::string& busId) const;
+  bool IsTopologyEligible(int localDeviceId, const std::string& remoteBusId) const;
+  void BuildTopologyMap();
+  bool IsSameProcessEngine(const EngineKey& engineKey) const;
+  bool IsSameNodeEngine(const EngineKey& engineKey) const;
   void* GetRemappedAddress(const MemoryDesc& desc, int localDeviceId);
 
   struct SessionCacheKey {
@@ -132,15 +145,37 @@ class XgmiBackend : public Backend {
 
   int numDevices{0};
   std::vector<std::vector<bool>> p2pMatrix;
+  std::unordered_map<std::string, int> localDeviceByBusId;
+  std::unordered_map<std::string, uint64_t> gpuTopoByBusId;  // normalized bus ID -> XGMI hive ID
 
   struct IpcHandleEntry {
     hipIpcMemHandle_t handle;
     void* remappedAddr{nullptr};
     size_t size{0};
   };
+  struct IpcCacheKey {
+    EngineKey engineKey;
+    MemoryUniqueId memId;
+    int deviceId;
+    bool operator==(const IpcCacheKey& o) const {
+      return engineKey == o.engineKey && memId == o.memId && deviceId == o.deviceId;
+    }
+  };
+  struct IpcCacheKeyHash {
+    std::size_t operator()(const IpcCacheKey& k) const noexcept {
+      std::size_t seed = 0;
+      auto hash_combine = [](std::size_t& value, std::size_t next) {
+        value ^= next + 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
+      };
+      hash_combine(seed, std::hash<std::string>()(k.engineKey));
+      hash_combine(seed, std::hash<uint64_t>()(k.memId));
+      hash_combine(seed, std::hash<int>()(k.deviceId));
+      return seed;
+    }
+  };
   mutable std::shared_mutex ipcMutex;
   std::unordered_map<MemoryUniqueId, hipIpcMemHandle_t> localIpcHandles;
-  std::unordered_map<MemoryUniqueId, IpcHandleEntry> remoteIpcHandles;
+  std::unordered_map<IpcCacheKey, IpcHandleEntry, IpcCacheKeyHash> remoteIpcHandles;
 
   std::unordered_map<SessionCacheKey, std::unique_ptr<XgmiBackendSession>, SessionCacheKeyHash>
       sessionCache;
@@ -148,6 +183,10 @@ class XgmiBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+  int myPid{0};
+  std::string scatterGatherHsacoPath_;
+  std::vector<hipModule_t> scatterGatherModules_;
+  std::vector<hipFunction_t> scatterGatherFuncs_;
 };
 
 }  // namespace io

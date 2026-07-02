@@ -22,8 +22,13 @@
 #pragma once
 
 #include <execinfo.h>
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "rocm_smi/rocm_smi.h"
 
@@ -53,6 +58,8 @@ namespace application {
     }                                                                      \
   } while (0)
 
+// Bootstrap-only helper: this macro terminates the process and should not be
+// used in per-connection or per-transfer runtime paths.
 #define SYSCALL_RETURN_ZERO(stmt)                                                               \
   do {                                                                                          \
     auto _ret = (stmt);                                                                         \
